@@ -1,0 +1,7 @@
+# Xcode local state and generated output
+DerivedData/
+build/
+**/xcuserdata/
+**/*.xcuserstate
+**/*.xccheckout
+*.ipa
