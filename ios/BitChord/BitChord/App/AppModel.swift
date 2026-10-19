@@ -81,6 +81,9 @@ final class AppModel: ObservableObject {
     private var searchRequestID = UUID()
     private var streamRequestID = UUID()
     private var streamTask: Task<Void, Never>?
+    /// The stream being fed to the player and the ones behind it, for a
+    /// track whose first stream was refused.
+    private var streamAttempt: StreamAttempt?
     private var isApplyingPartyState = false
     private var childObservers = Set<AnyCancellable>()
 
@@ -159,6 +162,7 @@ final class AppModel: ObservableObject {
         playback.onPauseCommand = { [weak self] in self?.handleRemotePause() }
         playback.onTogglePlaybackCommand = { [weak self] in self?.togglePlayback() }
         playback.onSeekCommand = { [weak self] seconds in self?.seek(to: seconds) }
+        playback.onLoadFailure = { [weak self] error in self?.handleStreamFailure(error) }
         listenTogether.onPlaybackUpdate = { [weak self] state, position in
             self?.applyPartyPlayback(state, at: position)
         }
@@ -909,6 +913,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The stream being played and the ones behind it, for a track whose
+    /// first stream the player refused.
+    private struct StreamAttempt {
+        var track: MusicTrack
+        var autoplay: Bool
+        var startAt: TimeInterval
+        var candidates: [ResolvedMusicStream]
+        var index: Int
+        var requestID: UUID
+    }
+
     private func durationLabel(_ milliseconds: Int64?) -> String? {
         guard let milliseconds, milliseconds > 0 else { return nil }
         let seconds = milliseconds / 1000
@@ -928,6 +943,7 @@ final class AppModel: ObservableObject {
         streamRequestID = UUID()
         let requestID = streamRequestID
         streamTask?.cancel()
+        streamAttempt = nil
         playback.beginLoading(track)
         localAudio.recordRecent(track)
         currentStreamInfo = nil
@@ -949,25 +965,62 @@ final class AppModel: ObservableObject {
         streamTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let resolved = try await self.service.resolveStream(for: track, quality: quality)
+                let resolved = try await self.service.resolveStreams(for: track, quality: quality)
                 guard self.streamRequestID == requestID else { return }
-                self.currentStreamInfo = resolved
                 let sharedState = self.listenTogether.isInParty ? self.listenTogether.party?.playback : nil
                 let stateMatchesTrack = sharedState?.track?.videoId == track.videoID
                 let finalAutoplay = stateMatchesTrack ? (sharedState?.isPlaying ?? autoplay) : autoplay
                 let finalPosition = stateMatchesTrack ? (self.listenTogether.partyPositionSeconds ?? startAt) : startAt
-                self.playback.load(
-                    url: resolved.url,
-                    headers: resolved.headers,
+                self.streamAttempt = StreamAttempt(
                     track: track,
                     autoplay: finalAutoplay,
-                    startAt: finalPosition
+                    startAt: finalPosition,
+                    candidates: resolved,
+                    index: 0,
+                    requestID: requestID
                 )
+                self.loadNextCandidate()
             } catch {
                 guard self.streamRequestID == requestID else { return }
                 self.playback.failLoading(error.localizedDescription)
             }
         }
+    }
+
+    /// The next stream the resolver found for the track being played.
+    ///
+    /// The first one can be refused by the CDN even though it cleared the
+    /// probe, so the ones behind it are tried in turn before the track is
+    /// given up on.
+    private func loadNextCandidate(afterFailure error: Error? = nil) {
+        guard var attempt = streamAttempt else {
+            playback.failLoading(PlaybackController.message(for: error))
+            return
+        }
+        // A failure from a track that is no longer the one being played.
+        guard streamRequestID == attempt.requestID else { return }
+        guard attempt.index < attempt.candidates.count else {
+            streamAttempt = nil
+            playback.failLoading(PlaybackController.message(for: error))
+            return
+        }
+        let candidate = attempt.candidates[attempt.index]
+        attempt.index += 1
+        streamAttempt = attempt
+        currentStreamInfo = candidate
+        playback.load(
+            url: candidate.url,
+            headers: candidate.headers,
+            track: attempt.track,
+            autoplay: attempt.autoplay,
+            startAt: attempt.startAt
+        )
+    }
+
+    /// The player would not load the stream it was given: try the next one.
+    private func handleStreamFailure(_ error: Error?) {
+        guard let attempt = streamAttempt, streamRequestID == attempt.requestID else { return }
+        loadNextCandidate(afterFailure: error)
     }
 
     /// The on-device copy of a track, if one exists: a finished download

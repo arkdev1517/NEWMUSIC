@@ -36,28 +36,23 @@ struct BitChordRootView: View {
     private var mainTabs: some View {
         TabView(selection: $selectedTab) {
             HomeView()
+                .miniPlayerInset()
                 .tabItem { Label("Home", systemImage: "house.fill") }
                 .tag(AppTab.home)
             ExploreView()
+                .miniPlayerInset()
                 .tabItem { Label("Explore", systemImage: "safari") }
                 .tag(AppTab.explore)
             LibraryView()
+                .miniPlayerInset()
                 .tabItem { Label("Library", systemImage: "books.vertical") }
                 .tag(AppTab.library)
             SearchView()
+                .miniPlayerInset()
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
                 .tag(AppTab.search)
         }
         .tint(BitChordStyle.accent)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if model.playback.currentTrack != nil {
-                MiniPlayerView { model.showingPlayer = true }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 6)
-                    .padding(.bottom, 2)
-                    .background(.bar)
-            }
-        }
         .sheet(isPresented: $model.showingPlayer) {
             PlayerView()
                 .presentationDetents([.large])
@@ -104,4 +99,33 @@ enum AppTab: Hashable {
     case explore
     case library
     case search
+}
+
+/// The mini player, pinned above the tab bar.
+///
+/// It is an inset on each tab's own content and not on the `TabView`: an
+/// inset on the `TabView` itself lands on the row the tab bar is drawn
+/// in, so the two fight over the same space — the mini player covers the
+/// tabs, and there is no way to change the view while a track is playing.
+private struct MiniPlayerInset: ViewModifier {
+    @EnvironmentObject private var model: AppModel
+
+    func body(content: Content) -> some View {
+        content.safeAreaInset(edge: .bottom, spacing: 0) {
+            if model.playback.currentTrack != nil {
+                MiniPlayerView { model.showingPlayer = true }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 6)
+                    .padding(.bottom, 2)
+                    .background(.bar)
+            }
+        }
+    }
+}
+
+private extension View {
+    /// The mini player, above the tab bar.
+    func miniPlayerInset() -> some View {
+        modifier(MiniPlayerInset())
+    }
 }
