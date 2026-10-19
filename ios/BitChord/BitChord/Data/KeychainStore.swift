@@ -62,4 +62,10 @@ private struct KeychainError: LocalizedError {
 
 enum SessionCredential {
     static let youtubeCookie = "youtube-music-cookie"
+    /// Scrobbling secrets (Android keeps these in its settings store; the
+    /// Keychain is the secure equivalent on iOS).
+    static let lastfmAPIKey = "lastfm-api-key"
+    static let lastfmSecret = "lastfm-secret"
+    static let lastfmSessionKey = "lastfm-session-key"
+    static let listenBrainzToken = "listenbrainz-token"
 }

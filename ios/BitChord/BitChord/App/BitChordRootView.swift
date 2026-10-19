@@ -6,6 +6,34 @@ struct BitChordRootView: View {
     @State private var showingPartyInvite = false
 
     var body: some View {
+        Group {
+            if model.settings.onboardingComplete {
+                mainTabs
+            } else {
+                OnboardingView()
+            }
+        }
+        .preferredColorScheme(colorScheme)
+        .onOpenURL { url in
+            if model.listenTogether.openInvite(url) {
+                showingPartyInvite = true
+            }
+        }
+        .alert(
+            "BitChord",
+            isPresented: Binding(
+                get: { model.notice != nil },
+                set: { if !$0 { model.dismissNotice() } }
+            )
+        ) {
+            Button("OK", role: .cancel) { model.dismissNotice() }
+        } message: {
+            Text(model.notice ?? "")
+        }
+        .task { await model.listenTogether.restoreSavedParty() }
+    }
+
+    private var mainTabs: some View {
         TabView(selection: $selectedTab) {
             HomeView()
                 .tabItem { Label("Home", systemImage: "house.fill") }
@@ -32,6 +60,20 @@ struct BitChordRootView: View {
         }
         .sheet(isPresented: $model.showingPlayer) {
             PlayerView()
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        // "Go to artist / album" from any row or menu lands here.
+        .sheet(item: $model.presentedRoute) { route in
+            NavigationStack {
+                BrowseDetailView(route: route)
+            }
+            .tint(BitChordStyle.accent)
+            .presentationDragIndicator(.visible)
+        }
+        // "Add to playlist" from any context menu lands here.
+        .sheet(item: $model.playlistPickerTrack) { track in
+            AddToPlaylistSheet(track: track)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -46,24 +88,6 @@ struct BitChordRootView: View {
             }
             .tint(BitChordStyle.accent)
         }
-        .onOpenURL { url in
-            if model.listenTogether.openInvite(url) {
-                showingPartyInvite = true
-            }
-        }
-        .alert(
-            "BitChord",
-            isPresented: Binding(
-                get: { model.notice != nil },
-                set: { if !$0 { model.dismissNotice() } }
-            )
-        ) {
-            Button("OK", role: .cancel) { model.dismissNotice() }
-        } message: {
-            Text(model.notice ?? "")
-        }
-        .preferredColorScheme(colorScheme)
-        .task { await model.listenTogether.restoreSavedParty() }
     }
 
     private var colorScheme: ColorScheme? {

@@ -2,13 +2,14 @@ import SwiftUI
 import UIKit
 
 enum BitChordStyle {
-    static let accent = Color(red: 0.98, green: 0.23, blue: 0.39)
-    static let secondaryAccent = Color(red: 0.72, green: 0.27, blue: 0.76)
+    /// Apple Music's signature red, `AccentRed` in the Android theme
+    /// (`0xFFFA2D48`) — the one colour the app spends everywhere.
+    static let accent = Color(red: 0.980, green: 0.176, blue: 0.282)
     static let groupedBackground = Color(uiColor: .systemGroupedBackground)
     static let cardBackground = Color(uiColor: .secondarySystemGroupedBackground)
 
     static let brandGradient = LinearGradient(
-        colors: [Color(red: 0.98, green: 0.36, blue: 0.46), Color(red: 0.96, green: 0.13, blue: 0.24)],
+        colors: [Color(red: 0.99, green: 0.35, blue: 0.46), Color(red: 0.96, green: 0.13, blue: 0.24)],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
@@ -137,6 +138,10 @@ struct TrackRow: View {
     let track: MusicTrack
     var isCurrent = false
     var isPlaying = false
+    /// Rows get the song-actions context menu unless the host supplies its
+    /// own (the imported-files list adds its file-removal menu instead).
+    var showsContextMenu = true
+    var currentPlaylistID: String? = nil
     let action: () -> Void
 
     var body: some View {
@@ -154,6 +159,7 @@ struct TrackRow: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 4)
+                DownloadStatusView(track: track)
                 if isCurrent && isPlaying {
                     Image(systemName: "waveform")
                         .foregroundStyle(BitChordStyle.accent)
@@ -163,16 +169,17 @@ struct TrackRow: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                Image(systemName: "play.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(BitChordStyle.accent)
-                    .padding(.leading, 4)
             }
             .contentShape(Rectangle())
             .padding(.vertical, 5)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Play \(track.title) by \(track.artist)")
+        .contextMenu {
+            if showsContextMenu {
+                TrackActionsMenu(track: track, currentPlaylistID: currentPlaylistID)
+            }
+        }
     }
 }
 
@@ -191,6 +198,13 @@ struct MusicItemCard: View {
             }
         }
         .accessibilityLabel("\(item.title)\(item.subtitle.isEmpty ? "" : ", \(item.subtitle)")")
+        .contextMenu {
+            if let track = item.track() {
+                TrackActionsMenu(track: track)
+            } else if item.browseID != nil {
+                BrowseActionsMenu(item: item)
+            }
+        }
     }
 
     private var cardContent: some View {
@@ -243,5 +257,165 @@ struct SettingsToolbarButton: View {
                 .foregroundStyle(.primary)
         }
         .accessibilityLabel("Settings")
+    }
+}
+
+/// YouTube serves artwork at the size named in the URL (`w60-h60`), which is
+/// far too small for headers and the player. Asking for a bigger rendition
+/// is a URL rewrite, the same one the Android image loader performs.
+enum ArtworkURL {
+    static func upgraded(_ raw: String?, target: Int = 540) -> String? {
+        guard let raw else { return nil }
+        let pattern = try! NSRegularExpression(pattern: #"w\d+-h\d+"#)
+        let range = NSRange(raw.startIndex..., in: raw)
+        guard pattern.firstMatch(in: raw, range: range) != nil else { return raw }
+        return pattern.stringByReplacingMatches(in: raw, range: range, withTemplate: "w\(target)-h\(target)")
+    }
+}
+
+/// The small download state glyph rows carry: a spinner of progress while
+/// the bytes move, a filled arrow once the track lives on the device.
+struct DownloadStatusView: View {
+    let track: MusicTrack
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        if let progress = model.downloads.progress[track.id] {
+            ProgressView(value: progress)
+                .progressViewStyle(.circular)
+                .controlSize(.mini)
+                .frame(width: 16, height: 16)
+                .accessibilityLabel("Downloading, \(Int(progress * 100)) percent")
+        } else if model.downloads.isDownloaded(track) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Downloaded")
+        }
+    }
+}
+
+/// The song actions — Android's `SongActionsSheet` as a menu. Used inside
+/// `.contextMenu` on rows and cards, and from the player's overflow menu,
+/// so every surface offers the same verbs for a track.
+struct TrackActionsMenu: View {
+    let track: MusicTrack
+    /// Set when the row lives inside that playlist's own page.
+    var currentPlaylistID: String? = nil
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Button {
+            model.playTrackNext(track)
+        } label: { Label("Play next", systemImage: "text.line.first.and.arrowtriangle.forward") }
+
+        Button {
+            model.addToQueue(track)
+        } label: { Label("Add to queue", systemImage: "text.append") }
+
+        if track.videoID != nil {
+            Button {
+                model.startRadio(track)
+            } label: { Label("Start radio", systemImage: "dot.radiowaves.left.and.right") }
+        }
+
+        Divider()
+
+        if track.videoID != nil {
+            Button {
+                model.toggleLike(track)
+            } label: {
+                Label(
+                    model.likedTrackIDs.contains(track.id) ? "Remove from Liked Music" : "Like",
+                    systemImage: model.likedTrackIDs.contains(track.id) ? "heart.fill" : "heart"
+                )
+            }
+            Button {
+                model.toggleDislike(track)
+            } label: {
+                Label(
+                    model.dislikedTrackIDs.contains(track.id) ? "Undo dislike" : "Dislike",
+                    systemImage: model.dislikedTrackIDs.contains(track.id) ? "hand.thumbsdown.fill" : "hand.thumbsdown"
+                )
+            }
+        }
+
+        Button {
+            model.playlistPickerTrack = track
+        } label: { Label("Add to playlist", systemImage: "text.badge.plus") }
+
+        if let currentPlaylistID, track.setVideoID != nil {
+            Button(role: .destructive) {
+                model.removeTrackFromAccountPlaylist(track, playlistID: currentPlaylistID)
+            } label: { Label("Remove from this playlist", systemImage: "text.badge.minus") }
+        }
+
+        Divider()
+
+        if track.videoID != nil {
+            if model.downloads.isDownloading(track) {
+                Button(role: .destructive) {
+                    model.downloads.cancel(track)
+                } label: { Label("Cancel download", systemImage: "xmark.circle") }
+            } else if model.downloads.isDownloaded(track) {
+                Button(role: .destructive) {
+                    model.deleteDownload(track)
+                } label: { Label("Delete download", systemImage: "trash") }
+            } else {
+                Button {
+                    model.downloadTrack(track)
+                } label: { Label("Download", systemImage: "arrow.down.circle") }
+            }
+        }
+
+        Button {
+            model.presentArtist(for: track)
+        } label: { Label("Go to artist", systemImage: "person.crop.circle") }
+
+        if track.albumBrowseID != nil {
+            Button {
+                model.presentAlbum(for: track)
+            } label: { Label("Go to album", systemImage: "opticaldisc") }
+        }
+
+        if let url = track.shareURL {
+            ShareLink(item: url) {
+                Label("Share", systemImage: "square.and.arrow.up")
+            }
+        }
+    }
+}
+
+/// The collection-card actions (Android's `BrowseActionsSheet`).
+struct BrowseActionsMenu: View {
+    let item: MusicItem
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Button {
+            model.playCollection(item, shuffled: false)
+        } label: { Label("Play", systemImage: "play.fill") }
+
+        Button {
+            model.playCollection(item, shuffled: true)
+        } label: { Label("Shuffle play", systemImage: "shuffle") }
+
+        if let url = shareURL {
+            ShareLink(item: url) {
+                Label("Share", systemImage: "square.and.arrow.up")
+            }
+        }
+    }
+
+    private var shareURL: URL? {
+        guard let browseID = item.browseID else { return nil }
+        switch item.kind {
+        case .playlist:
+            return URL(string: "https://music.youtube.com/playlist?list=\(browseID.removingVLPrefix)")
+        case .artist:
+            return URL(string: "https://music.youtube.com/channel/\(browseID)")
+        default:
+            return URL(string: "https://music.youtube.com/browse/\(browseID)")
+        }
     }
 }

@@ -3,6 +3,14 @@ import Foundation
 struct ResolvedMusicStream: Sendable {
     var url: URL
     var headers: [String: String]
+    /// Format facts for the player's "stats for nerds" line. All optional:
+    /// a locally downloaded copy resolves without any of them.
+    var codec: String? = nil
+    var bitrateKbps: Int? = nil
+    var sampleRateHz: Int? = nil
+    /// The InnerTube client that produced this URL (e.g. "IOS"), shown in
+    /// stats and used to dress the media request as the minting client.
+    var clientName: String? = nil
 }
 
 /// Test seam for the music catalogue, account mutations and stream resolver.
@@ -23,4 +31,42 @@ protocol MusicService: Sendable {
     func account() async throws -> MusicAccount
     func setLiked(_ liked: Bool, videoID: String) async throws
     func resolveStream(for track: MusicTrack) async throws -> ResolvedMusicStream
+    /// Stream resolution under a quality ceiling (Android's per-network
+    /// `AudioQuality`). The no-ceiling overload above stays for callers that
+    /// have no connection context.
+    func resolveStream(for track: MusicTrack, quality: AudioQuality) async throws -> ResolvedMusicStream
+
+    // Radio / autoplay: the watch-next queue for `RDAMVM<videoID>`.
+    func radio(videoID: String) async throws -> [MusicTrack]
+
+    // Account writes, ported verb-for-verb from `Innertube.kt`.
+    func rate(_ status: LikeStatus, videoID: String) async throws
+    func setSaved(_ saved: Bool, playlistID: String) async throws
+    func setSubscribed(_ subscribed: Bool, channelID: String) async throws
+    func createPlaylist(title: String, description: String, videoIDs: [String]) async throws -> String
+    func deletePlaylist(_ playlistID: String) async throws
+    /// Returns videoID → setVideoID for the entries the response named.
+    func addToPlaylist(_ playlistID: String, videoIDs: [String]) async throws -> [String: String]
+    func removeFromPlaylist(_ playlistID: String, entries: [PlaylistEntryRef]) async throws
+    /// The account's own/saved playlists, for the "Add to playlist" picker.
+    func accountPlaylists() async throws -> [MusicItem]
+    /// Exact-name artist lookup (Android's `findArtistPageId` safety rule:
+    /// a hit counts only when its own title is the name asked for).
+    func findArtistPageID(name: String) async throws -> String?
+
+    // Lyrics sources that ride on InnerTube itself.
+    /// YouTube Music's Lyrics tab for the exact video (plain, untimed text).
+    func youtubeLyrics(videoID: String) async throws -> [LyricLine]?
+    /// Timed caption transcript for the exact video.
+    func transcriptLyrics(videoID: String) async throws -> [LyricLine]?
+
+    /// The signed-in account's listening history page (`FEmusic_history`).
+    func historyTracks() async throws -> [MusicTrack]
+}
+
+/// One playlist entry identified the way `browse/edit_playlist` wants it:
+/// the entry's set-video-id plus the video id.
+struct PlaylistEntryRef: Sendable, Hashable {
+    var setVideoID: String
+    var videoID: String
 }

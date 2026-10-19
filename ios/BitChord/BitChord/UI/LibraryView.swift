@@ -5,12 +5,16 @@ struct LibraryView: View {
     @EnvironmentObject private var model: AppModel
     @State private var path: [BrowseRoute] = []
     @State private var showingImporter = false
+    @State private var showingNewPlaylist = false
+    @State private var newPlaylistName = ""
 
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 23) {
+                    shortcutsSection
                     accountLibrarySection
+                    playlistsSection
                     recentSection
                     localSection
                 }
@@ -51,6 +55,140 @@ struct LibraryView: View {
         .task { await model.loadLibrary() }
         .onChange(of: model.isYouTubeSignedIn) { _, signedIn in
             if signedIn { Task { await model.loadLibrary(force: true) } }
+        }
+    }
+
+    private var shortcutsSection: some View {
+        VStack(spacing: 10) {
+            shortcutRow(
+                title: "Downloads",
+                detail: model.downloads.downloads.isEmpty
+                    ? "Songs saved for offline listening"
+                    : "\(model.downloads.downloads.count) song\(model.downloads.downloads.count == 1 ? "" : "s") · \(ByteCountFormatter.string(fromByteCount: Int64(model.downloads.totalBytes), countStyle: .file))",
+                systemImage: "arrow.down.circle.fill"
+            ) {
+                DownloadsView()
+            }
+            shortcutRow(
+                title: "History",
+                detail: "What you've been listening to",
+                systemImage: "clock.arrow.circlepath"
+            ) {
+                HistoryView()
+            }
+            shortcutRow(
+                title: "Your Replay",
+                detail: "Top songs, artists and listening time",
+                systemImage: "chart.bar.fill"
+            ) {
+                StatsView()
+            }
+        }
+    }
+
+    private func shortcutRow<Destination: View>(
+        title: String,
+        detail: String,
+        systemImage: String,
+        @ViewBuilder destination: @escaping () -> Destination
+    ) -> some View {
+        NavigationLink {
+            destination()
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: systemImage)
+                    .font(.title3)
+                    .foregroundStyle(.white)
+                    .frame(width: 42, height: 42)
+                    .background(BitChordStyle.accent, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(12)
+            .background(BitChordStyle.cardBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var playlistsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                ShelfHeader(title: "Your playlists", subtitle: "Kept on this iPhone")
+                Spacer()
+                Button {
+                    newPlaylistName = ""
+                    showingNewPlaylist = true
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(BitChordStyle.accent)
+                }
+                .accessibilityLabel("New playlist")
+            }
+            if model.playlists.playlists.isEmpty {
+                Text("Playlists you make on this iPhone live here. They work signed-out and are part of your backup.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+            } else {
+                ForEach(model.playlists.playlists) { playlist in
+                    NavigationLink {
+                        LocalPlaylistDetailView(playlistID: playlist.id)
+                    } label: {
+                        HStack(spacing: 13) {
+                            ArtworkView(url: playlist.artworkURL, size: 54)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(playlist.name)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text("^[\(playlist.tracks.count) song](inflect: true)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                        .padding(.vertical, 3)
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button {
+                            if let first = playlist.tracks.first {
+                                model.play(first, queue: playlist.tracks)
+                            }
+                        } label: { Label("Play", systemImage: "play.fill") }
+                        Button {
+                            model.playShuffled(playlist.tracks)
+                        } label: { Label("Shuffle play", systemImage: "shuffle") }
+                        Button(role: .destructive) {
+                            model.playlists.delete(playlist)
+                        } label: { Label("Delete playlist", systemImage: "trash") }
+                    }
+                }
+            }
+        }
+        .alert("New playlist", isPresented: $showingNewPlaylist) {
+            TextField("Playlist name", text: $newPlaylistName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") {
+                model.playlists.createPlaylist(name: newPlaylistName)
+            }
         }
     }
 
@@ -143,11 +281,14 @@ struct LibraryView: View {
                     TrackRow(
                         track: track,
                         isCurrent: model.playback.currentTrack?.id == track.id,
-                        isPlaying: model.playback.isPlaying
+                        isPlaying: model.playback.isPlaying,
+                        showsContextMenu: false
                     ) {
                         model.play(track, queue: model.localAudio.tracks)
                     }
                     .contextMenu {
+                        TrackActionsMenu(track: track)
+                        Divider()
                         Button(role: .destructive) {
                             do { try model.localAudio.remove(track) }
                             catch { model.notice = error.localizedDescription }

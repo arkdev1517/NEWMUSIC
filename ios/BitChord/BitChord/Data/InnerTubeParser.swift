@@ -156,14 +156,181 @@ enum InnerTubeParser {
             artworkURL: artwork,
             items: items,
             tracks: tracks,
-            continuation: continuation
+            continuation: continuation,
+            playlistID: playlistIDFromPlayAction(root, header: header),
+            isSubscribed: subscriptionState(root),
+            pageDescription: pageDescription(root)
         )
+    }
+
+    /// `InnertubeParser.playlistIdFromPlayAction`: the header's play button
+    /// endpoints name the playlist an album/playlist page would play, which
+    /// is also the id library saves are addressed to.
+    private static func playlistIDFromPlayAction(_ root: InnerTubeObject, header: InnerTubeObject?) -> String? {
+        func candidate(in scope: Any?) -> String? {
+            guard let scope else { return nil }
+            for endpoint in collect(scope, key: "watchPlaylistEndpoint") {
+                if let playlistID = string(endpoint["playlistId"]), !playlistID.isEmpty { return playlistID }
+            }
+            for endpoint in collect(scope, key: "watchEndpoint") {
+                if let playlistID = string(endpoint["playlistId"]), !playlistID.isEmpty { return playlistID }
+            }
+            return nil
+        }
+        return candidate(in: header) ?? candidate(in: root)
+    }
+
+    private static func pageDescription(_ root: InnerTubeObject) -> String {
+        guard let shelf = collect(root, key: "musicDescriptionShelfRenderer").first else { return "" }
+        return text(shelf["description"]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The subscribe button an artist page renders for a signed-in session
+    /// states its own status (`isSubscribed` on the renderer). Anonymous
+    /// pages carry no button, and the absence says nothing.
+    private static func subscriptionState(_ root: Any) -> Bool? {
+        for button in collect(root, key: "subscribeButtonRenderer") {
+            if let subscribed = button["subscribed"] as? Bool { return subscribed }
+            if let subscribed = (button["subscribed"] as? NSNumber)?.boolValue { return subscribed }
+        }
+        return nil
     }
 
     static func parseHistoryTracks(_ root: Any) -> [MusicTrack] {
         collect(root, key: "musicResponsiveListItemRenderer")
             .compactMap(parseTrack)
             .deduplicated(by: \.id)
+    }
+
+    /// The watch-next queue of a `next` response — what Android's
+    /// `parseWatchQueue` reads for radio and autoplay. The seed track itself
+    /// is the first entry; callers drop it when topping up a queue.
+    static func parseWatchQueue(_ root: Any) -> [MusicTrack] {
+        var seen = Set<String>()
+        var tracks: [MusicTrack] = []
+        for renderer in collect(root, key: "playlistPanelVideoRenderer") {
+            guard let videoID = string(renderer["videoId"]), !videoID.isEmpty,
+                  seen.insert(videoID).inserted else { continue }
+            let title = text(renderer["title"])
+            guard !title.isEmpty else { continue }
+            // The byline packs artist, views and likes into one run list;
+            // only the leading runs before the first bullet are the credit.
+            let bylineRuns = runs(renderer["longBylineText"])
+            let byline = bylineRuns.map { string($0["text"]) ?? "" }
+            let artist = byline.prefix(while: { !$0.contains("•") }).joined().trimmingCharacters(in: .whitespaces)
+            let credits = bylineCredits(bylineRuns)
+            let duration = text(renderer["lengthText"])
+            tracks.append(MusicTrack(
+                videoID: videoID,
+                title: title,
+                artist: artist.isEmpty ? "Unknown artist" : artist,
+                artworkURL: thumbnailURL(renderer),
+                durationText: duration.isEmpty ? nil : duration,
+                albumName: credits.albumName,
+                localFileName: nil,
+                // A catalogue track is credited "Artist • Album • Year"; the
+                // matching music video is "Artist • 417M views • 2.4M likes".
+                isVideo: byline.contains { $0.localizedCaseInsensitiveContains("views") },
+                artistBrowseID: credits.artistID,
+                albumBrowseID: credits.albumID
+            ))
+        }
+        return tracks
+    }
+
+    /// The browse endpoint behind the Lyrics tab of a `next` response.
+    /// Mirrors `YouTubeMusicLyrics`: prefer the tab literally titled
+    /// "Lyrics", else the first non-queue tab that carries a browse endpoint.
+    static func lyricsBrowseEndpoint(_ root: Any) -> (browseID: String, params: String?)? {
+        let tabs = collect(root, key: "tabRenderer")
+        func endpoint(of tab: InnerTubeObject) -> (String, String?)? {
+            for candidate in collect(tab, key: "browseEndpoint") {
+                if let browseID = string(candidate["browseId"]), !browseID.isEmpty {
+                    return (browseID, string(candidate["params"]))
+                }
+            }
+            return nil
+        }
+        for tab in tabs where allStrings(tab).contains(where: { $0.caseInsensitiveCompare("Lyrics") == .orderedSame }) {
+            if let found = endpoint(of: tab) { return found }
+        }
+        for tab in tabs.dropFirst() {
+            if let found = endpoint(of: tab) { return found }
+        }
+        return nil
+    }
+
+    /// Plain (untimed) lyric lines from a lyrics browse page's
+    /// `musicDescriptionShelfRenderer`.
+    static func parseLyricsPage(_ root: Any) -> [LyricLine]? {
+        guard let shelf = collect(root, key: "musicDescriptionShelfRenderer").first else { return nil }
+        let body = text(shelf["description"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        let lines = body.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .map { LyricLine(timeMs: 0, text: $0) }
+        return lines.isEmpty ? nil : lines
+    }
+
+    /// Timed lines from a `get_transcript` response's caption cues.
+    static func parseTranscript(_ root: Any) -> [LyricLine]? {
+        let lines = collect(root, key: "transcriptCueRenderer").compactMap { cue -> LyricLine? in
+            guard let start = number(cue["startOffsetMs"]) else { return nil }
+            let body = text(cue["cue"]).trimmingCharacters(in: CharacterSet(charactersIn: " \n♪"))
+            guard !body.isEmpty else { return nil }
+            return LyricLine(timeMs: Int(start), text: body)
+        }.sorted { $0.timeMs < $1.timeMs }
+        return lines.isEmpty ? nil : lines
+    }
+
+    /// First string value stored under `key` anywhere in the tree — the same
+    /// find-by-name fallback Android uses for a created playlist's id.
+    static func findString(_ root: Any, key: String) -> String? {
+        for container in collectContainers(root, key: key) {
+            if let value = string(container[key]), !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    /// Artist/album browse ids and the album name linked from a byline's
+    /// runs. Runs before the first bullet credit artists; a later run whose
+    /// endpoint is an album page names the album.
+    private static func bylineCredits(_ bylineRuns: [InnerTubeObject]) -> (artistID: String?, albumID: String?, albumName: String?) {
+        var artistID: String?
+        var albumID: String?
+        var albumName: String?
+        for run in bylineRuns {
+            guard let endpoint = object(path(run, "navigationEndpoint", "browseEndpoint")),
+                  let browseID = string(endpoint["browseId"]), !browseID.isEmpty else { continue }
+            let pageType = string(path(endpoint, "browseEndpointContextSupportedConfigs", "browseEndpointContextMusicConfig", "pageType")) ?? ""
+            if pageType.contains("ARTIST"), artistID == nil {
+                artistID = browseID
+            } else if pageType.contains("ALBUM"), albumID == nil {
+                albumID = browseID
+                albumName = string(run["text"])?.trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return (artistID, albumID, albumName)
+    }
+
+    private static func runs(_ value: Any?) -> [InnerTubeObject] {
+        guard let dict = value as? InnerTubeObject, let runs = dict["runs"] as? [Any] else { return [] }
+        return runs.compactMap { $0 as? InnerTubeObject }
+    }
+
+    /// Every plain string in a subtree, in traversal order (Android's
+    /// `youtubeStrings` reduced to what the lyrics-tab search needs).
+    private static func allStrings(_ root: Any) -> [String] {
+        var out: [String] = []
+        func walk(_ value: Any, depth: Int) {
+            guard depth < 40 else { return }
+            if let string = value as? String { out.append(string) }
+            else if let dict = value as? InnerTubeObject { for child in dict.values { walk(child, depth: depth + 1) } }
+            else if let array = value as? [Any] { for child in array { walk(child, depth: depth + 1) } }
+        }
+        walk(root, depth: 0)
+        return out
     }
 
     static func parseAccount(_ root: InnerTubeObject) -> MusicAccount? {
@@ -345,15 +512,23 @@ enum InnerTubeParser {
         let isWide = dimensions.map { width, height in
             width > 0 && height > 0 && !(0.85...1.15).contains(width / height)
         } ?? false
+        // The byline's runs link out to the artist and album pages; keep them
+        // so a row knows where it came from. A playlist row also carries the
+        // per-entry set-video-id a later removal has to be expressed in.
+        let bylineRuns = runs(path(columns.dropFirst().first, "musicResponsiveListItemFlexColumnRenderer", "text"))
+        let credits = bylineCredits(bylineRuns)
         return MusicTrack(
             videoID: videoID,
             title: title,
             artist: artist.isEmpty ? "Unknown artist" : artist,
             artworkURL: art,
             durationText: duration,
-            albumName: nil,
+            albumName: credits.albumName,
             localFileName: nil,
-            isVideo: rowType == "video" || isWide
+            isVideo: rowType == "video" || isWide,
+            setVideoID: string(path(renderer, "playlistItemData", "playlistSetVideoId")),
+            artistBrowseID: credits.artistID,
+            albumBrowseID: credits.albumID
         )
     }
 

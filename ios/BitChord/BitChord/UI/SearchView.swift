@@ -306,6 +306,9 @@ struct SearchView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .contextMenu {
+                BrowseActionsMenu(item: item)
+            }
         }
     }
 

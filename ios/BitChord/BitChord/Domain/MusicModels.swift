@@ -180,20 +180,41 @@ struct MusicBrowsePage: Sendable {
     var items: [MusicItem]
     var tracks: [MusicTrack]
     var continuation: String?
+    /// The id the page itself names for library saves (`OLAK…` for albums,
+    /// the bare id for playlists), read from the header's play action the
+    /// way Android's `playlistIdFromPlayAction` does. The browse id is not
+    /// interchangeable with it.
+    var playlistID: String? = nil
+    /// Session-only flag from the page's own subscribe button, when the
+    /// renderer carried one. Nil when the page said nothing either way.
+    var isSubscribed: Bool? = nil
+    /// The page's own description text (playlist/album descriptions live in
+    /// a `musicDescriptionShelfRenderer`).
+    var pageDescription: String = ""
 }
 
 /// A track in a queue or the locally imported library. Remote YouTube identity
 /// is kept as a video id; imported files are copied into app-owned storage and
 /// addressed by their sandbox filename.
 struct MusicTrack: Identifiable, Codable, Hashable, Sendable {
-    var videoID: String?
+    var videoID: String? = nil
     var title: String
     var artist: String
-    var artworkURL: String?
-    var durationText: String?
-    var albumName: String?
-    var localFileName: String?
+    var artworkURL: String? = nil
+    var durationText: String? = nil
+    var albumName: String? = nil
+    var localFileName: String? = nil
     var isVideo: Bool = false
+    /// The per-entry id YouTube mints for a track inside a playlist
+    /// (`playlistSetVideoId`). The same video added twice is two entries; a
+    /// removal has to name the entry, so rows parsed from a playlist page
+    /// carry it. Optional so manifests written before this field existed
+    /// still decode.
+    var setVideoID: String? = nil
+    /// Browse ids recovered from the byline's linked runs, so "Go to artist"
+    /// and "Go to album" work from any row that carried them.
+    var artistBrowseID: String? = nil
+    var albumBrowseID: String? = nil
 
     var id: String {
         if let videoID, !videoID.isEmpty { return "youtube:\(videoID)" }
