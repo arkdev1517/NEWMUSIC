@@ -28,6 +28,7 @@ final class PlaybackController: ObservableObject {
     var onLoadFailure: ((Error?) -> Void)?
 
     private let player = AVPlayer()
+    private var resourceLoader: ChunkedResourceLoader?
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var itemObservation: NSKeyValueObservation?
@@ -89,6 +90,24 @@ final class PlaybackController: ObservableObject {
         autoplay: Bool = true,
         startAt: TimeInterval = 0
     ) {
+        loadInternal(
+            url: url,
+            headers: headers,
+            track: track,
+            autoplay: autoplay,
+            startAt: startAt,
+            useChunkedLoader: Self.shouldUseChunkedLoader(for: url)
+        )
+    }
+
+    private func loadInternal(
+        url: URL,
+        headers: [String: String],
+        track: MusicTrack,
+        autoplay: Bool,
+        startAt: TimeInterval,
+        useChunkedLoader: Bool
+    ) {
         removeItemObservers()
         currentTrack = track
         errorMessage = nil
@@ -98,10 +117,19 @@ final class PlaybackController: ObservableObject {
         autoplayWhenReady = autoplay
         initialPosition = startAt.isFinite ? max(0, startAt) : 0
 
-        let options: [String: Any] = headers.isEmpty
-            ? [:]
-            : ["AVURLAssetHTTPHeaderFieldsKey": headers]
-        let asset = AVURLAsset(url: url, options: options)
+        let asset: AVURLAsset
+        if useChunkedLoader, let loader = ChunkedResourceLoader(originalURL: url, headers: headers) {
+            self.resourceLoader = loader
+            let customAsset = AVURLAsset(url: loader.assetURL)
+            customAsset.resourceLoader.setDelegate(loader, queue: loader.delegateQueue)
+            asset = customAsset
+        } else {
+            let options: [String: Any] = headers.isEmpty
+                ? [:]
+                : ["AVURLAssetHTTPHeaderFieldsKey": headers]
+            asset = AVURLAsset(url: url, options: options)
+        }
+
         let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
         itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
@@ -116,13 +144,24 @@ final class PlaybackController: ObservableObject {
                     self.startReadyItem()
                     self.publishNowPlaying()
                 case .failed:
-                    self.isLoading = false
-                    self.errorMessage = Self.message(for: observedItem.error)
-                    self.publishNowPlaying()
-                    // The caller may have another stream for this track: a
-                    // URL that cleared the probe can still be turned down by
-                    // the CDN once the player asks it for real bytes.
-                    self.onLoadFailure?(observedItem.error)
+                    if useChunkedLoader && self.position < 1 {
+                        self.loadInternal(
+                            url: url,
+                            headers: headers,
+                            track: track,
+                            autoplay: autoplay,
+                            startAt: startAt,
+                            useChunkedLoader: false
+                        )
+                        return
+                    }
+                    if let onLoadFailure = self.onLoadFailure {
+                        onLoadFailure(observedItem.error)
+                    } else {
+                        self.isLoading = false
+                        self.errorMessage = Self.message(for: observedItem.error)
+                        self.publishNowPlaying()
+                    }
                 case .unknown:
                     break
                 @unknown default:
@@ -138,6 +177,18 @@ final class PlaybackController: ObservableObject {
             Task { @MainActor [weak self] in self?.onItemEnded?() }
         }
         publishNowPlaying()
+    }
+
+    private static func shouldUseChunkedLoader(for url: URL) -> Bool {
+        guard !url.isFileURL else { return false }
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "http" || scheme == "https" else { return false }
+        let path = url.path.lowercased()
+        if path.hasSuffix(".m3u8") || path.contains("/manifest/") {
+            return false
+        }
+        let host = url.host?.lowercased() ?? ""
+        return host.contains("googlevideo.com") || path.contains("videoplayback")
     }
 
     func failLoading(_ message: String) {
@@ -398,6 +449,8 @@ final class PlaybackController: ObservableObject {
     }
 
     private func removeItemObservers() {
+        resourceLoader?.cancelAll()
+        resourceLoader = nil
         itemObservation = nil
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
@@ -406,9 +459,306 @@ final class PlaybackController: ObservableObject {
     }
 
     deinit {
+        resourceLoader?.cancelAll()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
         if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+    }
+}
+
+/// Bounded byte-range `AVAssetResourceLoaderDelegate` for `googlevideo.com`
+/// streams (iOS counterpart to Android's `ChunkedDataSource` and Desktop's
+/// `DesktopRangeStream`).
+///
+/// `AVURLAsset` otherwise hands the URL to `mediaserverd`, which fetches the
+/// whole file in a single open-ended range with an `AppleCoreMedia`
+/// User-Agent — a shape `googlevideo.com` throttles to ~15 KB/s or refuses
+/// outright with HTTP 403. Fetching 512 KiB windows over `URLSession` with
+/// the minting client's headers keeps every request bounded and authenticated.
+final class ChunkedResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+    private static let customScheme = "bitchord-stream"
+    private static let windowBytes = 524_288
+    private static let maxCachedWindows = 24
+    private static let maxRetries = 3
+
+    let originalURL: URL
+    let assetURL: URL
+    let headers: [String: String]
+    let delegateQueue = DispatchQueue(label: "com.music.bitchord.resource-loader")
+
+    private let session: URLSession
+    private var totalLength: Int64?
+    private var isVideoContainer = false
+    private var windows: [Int64: Data] = [:]
+    private var windowOrder: [Int64] = []
+    private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+
+    init?(
+        originalURL: URL,
+        headers: [String: String],
+        session: URLSession = .shared
+    ) {
+        guard var components = URLComponents(url: originalURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        components.scheme = Self.customScheme
+        guard let rewritten = components.url else { return nil }
+        self.originalURL = originalURL
+        self.assetURL = rewritten
+        self.headers = headers
+        self.session = session
+        if let clen = components.queryItems?.first(where: { $0.name == "clen" })?.value,
+           let parsed = Int64(clen), parsed > 0 {
+            self.totalLength = parsed
+        }
+        if let mime = components.queryItems?.first(where: { $0.name == "mime" })?.value,
+           mime.lowercased().contains("video") {
+            self.isVideoContainer = true
+        }
+        super.init()
+    }
+
+    func cancelAll() {
+        delegateQueue.async { [weak self] in
+            guard let self else { return }
+            for (_, task) in self.tasks {
+                task.cancel()
+            }
+            self.tasks.removeAll()
+            self.windows.removeAll()
+            self.windowOrder.removeAll()
+        }
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        let id = ObjectIdentifier(loadingRequest)
+        let task = Task { [weak self] in
+            await self?.fulfill(loadingRequest)
+        }
+        tasks[id] = task
+        return true
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        didCancel loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        let id = ObjectIdentifier(loadingRequest)
+        tasks[id]?.cancel()
+        tasks[id] = nil
+    }
+
+    private func fulfill(_ loadingRequest: AVAssetResourceLoadingRequest) async {
+        let id = ObjectIdentifier(loadingRequest)
+        defer {
+            delegateQueue.async { [weak self] in
+                self?.tasks[id] = nil
+            }
+        }
+
+        do {
+            let startOffset: Int64 = delegateQueue.sync {
+                if let dataRequest = loadingRequest.dataRequest {
+                    return dataRequest.currentOffset > 0 ? dataRequest.currentOffset : dataRequest.requestedOffset
+                }
+                return 0
+            }
+
+            let needsContentInfo: Bool = delegateQueue.sync {
+                loadingRequest.contentInformationRequest != nil && self.totalLength == nil
+            }
+            if needsContentInfo {
+                let firstWindowStart = (max(0, startOffset) / Int64(Self.windowBytes)) * Int64(Self.windowBytes)
+                _ = try await fetchWindow(startingAt: firstWindowStart)
+            }
+
+            delegateQueue.sync {
+                if let info = loadingRequest.contentInformationRequest {
+                    info.contentType = (self.isVideoContainer ? AVFileType.mp4 : AVFileType.m4a).rawValue
+                    info.isByteRangeAccessSupported = true
+                    if let totalLength = self.totalLength {
+                        info.contentLength = totalLength
+                    }
+                }
+            }
+
+            let dataParams: (start: Int64, length: Int, toEnd: Bool)? = delegateQueue.sync {
+                guard let dataRequest = loadingRequest.dataRequest else { return nil }
+                let start = dataRequest.currentOffset > 0 ? dataRequest.currentOffset : dataRequest.requestedOffset
+                return (start, dataRequest.requestedLength, dataRequest.requestsAllDataToEndOfResource)
+            }
+
+            if let dataParams {
+                var cursor = max(0, dataParams.start)
+                var targetEnd: Int64 = delegateQueue.sync {
+                    if dataParams.toEnd {
+                        return self.totalLength ?? Int64.max
+                    }
+                    let requestedEnd = dataParams.start + Int64(dataParams.length)
+                    if let total = self.totalLength {
+                        return min(requestedEnd, total)
+                    }
+                    return requestedEnd
+                }
+
+                while cursor < targetEnd {
+                    if Task.isCancelled { return }
+                    let isCancelled: Bool = delegateQueue.sync {
+                        loadingRequest.isCancelled || loadingRequest.isFinished
+                    }
+                    if isCancelled { return }
+
+                    let windowStart = (cursor / Int64(Self.windowBytes)) * Int64(Self.windowBytes)
+                    let windowData = try await fetchWindow(startingAt: windowStart)
+                    if windowData.isEmpty { break }
+
+                    targetEnd = delegateQueue.sync {
+                        if let info = loadingRequest.contentInformationRequest,
+                           let total = self.totalLength {
+                            info.contentLength = total
+                        }
+                        if dataParams.toEnd {
+                            return self.totalLength ?? Int64.max
+                        }
+                        let requestedEnd = dataParams.start + Int64(dataParams.length)
+                        if let total = self.totalLength {
+                            return min(requestedEnd, total)
+                        }
+                        return requestedEnd
+                    }
+
+                    let offsetInWindow = Int(cursor - windowStart)
+                    guard offsetInWindow >= 0 && offsetInWindow < windowData.count else { break }
+                    let available = windowData.count - offsetInWindow
+                    let remaining = targetEnd - cursor
+                    guard remaining > 0 else { break }
+                    let count = Int(min(Int64(available), remaining))
+                    let slice = windowData.subdata(in: offsetInWindow..<(offsetInWindow + count))
+
+                    let shouldStop: Bool = delegateQueue.sync {
+                        guard !loadingRequest.isCancelled && !loadingRequest.isFinished else { return true }
+                        loadingRequest.dataRequest?.respond(with: slice)
+                        return false
+                    }
+                    if shouldStop { return }
+
+                    cursor += Int64(count)
+                    if windowData.count < Self.windowBytes && self.totalLength == nil {
+                        break
+                    }
+                }
+            }
+
+            delegateQueue.sync {
+                guard !loadingRequest.isCancelled && !loadingRequest.isFinished else { return }
+                loadingRequest.finishLoading()
+            }
+        } catch {
+            delegateQueue.sync {
+                guard !loadingRequest.isCancelled && !loadingRequest.isFinished else { return }
+                loadingRequest.finishLoading(with: error)
+            }
+        }
+    }
+
+    private func fetchWindow(startingAt windowStart: Int64) async throws -> Data {
+        if let cached: Data = delegateQueue.sync(execute: { windows[windowStart] }) {
+            return cached
+        }
+
+        let knownTotal: Int64? = delegateQueue.sync { totalLength }
+        if let knownTotal, windowStart >= knownTotal {
+            return Data()
+        }
+
+        let rawEnd = windowStart + Int64(Self.windowBytes) - 1
+        let windowEnd = knownTotal.map { min(rawEnd, $0 - 1) } ?? rawEnd
+        guard windowEnd >= windowStart else { return Data() }
+
+        var lastError: Error = MusicRequestError.noPlayableStream
+        for attempt in 0..<Self.maxRetries {
+            if Task.isCancelled { throw CancellationError() }
+            var request = URLRequest(url: originalURL)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 12
+            request.setValue("bytes=\(windowStart)-\(windowEnd)", forHTTPHeaderField: "Range")
+            request.setValue("*/*", forHTTPHeaderField: "Accept")
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw MusicRequestError.invalidResponse
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    throw MusicRequestError.httpStatus(http.statusCode)
+                }
+                let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+                if contentType.hasPrefix("text/") {
+                    throw MusicRequestError.noPlayableStream
+                }
+                let parsedTotal = Self.parseTotalLength(from: http, fallbackDataCount: data.count, windowStart: windowStart)
+                let isVideo = contentType.contains("video/")
+                delegateQueue.sync {
+                    if let parsedTotal, parsedTotal > 0 {
+                        self.totalLength = parsedTotal
+                    }
+                    if isVideo {
+                        self.isVideoContainer = true
+                    }
+                    self.storeWindow(data, at: windowStart)
+                }
+                return data
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+                if attempt + 1 < Self.maxRetries {
+                    try? await Task.sleep(nanoseconds: UInt64(250_000_000 * (attempt + 1)))
+                }
+            }
+        }
+        throw lastError
+    }
+
+    private func storeWindow(_ data: Data, at windowStart: Int64) {
+        windows[windowStart] = data
+        windowOrder.removeAll { $0 == windowStart }
+        windowOrder.append(windowStart)
+        while windowOrder.count > Self.maxCachedWindows {
+            let oldest = windowOrder.removeFirst()
+            windows.removeValue(forKey: oldest)
+        }
+    }
+
+    static func parseTotalLength(
+        from response: HTTPURLResponse,
+        fallbackDataCount: Int,
+        windowStart: Int64
+    ) -> Int64? {
+        if let contentRange = response.value(forHTTPHeaderField: "Content-Range"),
+           let slash = contentRange.lastIndex(of: "/") {
+            let totalPart = contentRange[contentRange.index(after: slash)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let total = Int64(totalPart), total > 0 {
+                return total
+            }
+        }
+        if response.statusCode == 200,
+           let contentLength = response.value(forHTTPHeaderField: "Content-Length"),
+           let total = Int64(contentLength), total > 0 {
+            return total
+        }
+        if windowStart == 0 && response.statusCode == 200 && fallbackDataCount > 0 {
+            return Int64(fallbackDataCount)
+        }
+        return nil
     }
 }

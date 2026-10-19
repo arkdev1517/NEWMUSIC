@@ -108,8 +108,9 @@ struct PlayerLayout {
         let room = size.height - belowArtwork
         // A phone's width, and no wider than a comfortable column.
         let widest = min(max(size.width - 48, 240), 460)
-        // Never narrower than the transport and the action row need.
-        columnWidth = max(300, min(widest, room))
+        // Never narrower than the transport and the action row need, unless
+        // the window itself is narrower than that.
+        columnWidth = min(widest, max(300, min(widest, room)))
     }
 }
 
@@ -129,7 +130,6 @@ struct PlayerView: View {
             GeometryReader { geometry in
                 let layout = PlayerLayout(in: geometry.size)
                 ZStack {
-                    PlayerBackdrop(url: model.playback.currentTrack?.artworkURL)
                     if let track = model.playback.currentTrack {
                         VStack(spacing: 14) {
                             panelArea(track: track, size: layout.artworkSize)
@@ -170,16 +170,20 @@ struct PlayerView: View {
                         // scrubber, the transport and the action row across
                         // the whole thing, which is neither how the phone
                         // looks nor how the artwork lines up with them.
-                        .frame(maxWidth: layout.columnWidth)
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 24)
+                        .frame(width: layout.columnWidth)
                         .padding(.top, 8)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     } else {
                         EmptyStateView(
                             title: "Nothing is playing",
                             message: "Choose a song from Home, Explore, Library or Search."
                         )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .background {
+                    PlayerBackdrop(url: model.playback.currentTrack?.artworkURL)
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
@@ -648,24 +652,31 @@ private struct PlayerBackdrop: View {
     let url: String?
 
     var body: some View {
-        ZStack {
-            Color.black
-            if let url = ArtworkURL.upgraded(url, target: 360), let imageURL = URL(string: url) {
-                AsyncImage(url: imageURL) { phase in
-                    if let image = phase.image {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .blur(radius: 70)
-                            .saturation(1.4)
+        GeometryReader { proxy in
+            ZStack {
+                Color.black
+                if let url = ArtworkURL.upgraded(url, target: 360), let imageURL = URL(string: url) {
+                    AsyncImage(url: imageURL) { phase in
+                        if let image = phase.image {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: proxy.size.width, height: proxy.size.height)
+                                .clipped()
+                                .blur(radius: 70)
+                                .saturation(1.4)
+                        }
                     }
+                } else {
+                    BitChordStyle.brandGradient.opacity(0.5)
                 }
-            } else {
-                BitChordStyle.brandGradient.opacity(0.5)
+                Color.black.opacity(0.42)
             }
-            Color.black.opacity(0.42)
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .clipped()
         }
         .ignoresSafeArea()
+        .allowsHitTesting(false)
     }
 }
 
