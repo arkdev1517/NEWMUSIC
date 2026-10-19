@@ -46,12 +46,12 @@ actor LyricsService {
             )
         }
         if result == nil, let videoID = track.videoID {
-            if let lines = try? await service.transcriptLyrics(videoID: videoID), let lines, !lines.isEmpty {
+            if let lines = try? await service.transcriptLyrics(videoID: videoID), !lines.isEmpty {
                 result = TrackLyrics(lines: lines, source: .transcript, isSynced: true)
             }
         }
         if result == nil, let videoID = track.videoID {
-            if let lines = try? await service.youtubeLyrics(videoID: videoID), let lines, !lines.isEmpty {
+            if let lines = try? await service.youtubeLyrics(videoID: videoID), !lines.isEmpty {
                 result = TrackLyrics(lines: lines, source: .youtubeMusic, isSynced: false)
             }
         }
@@ -133,7 +133,7 @@ actor LyricsService {
                 )
                 guard let item = matching.first,
                       let text = try? await item.load(.stringValue),
-                      let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                 if LRCParser.looksSynced(text) {
                     let lines = LRCParser.parse(text)
                     if !lines.isEmpty { return TrackLyrics(lines: lines, source: .embedded, isSynced: true) }
