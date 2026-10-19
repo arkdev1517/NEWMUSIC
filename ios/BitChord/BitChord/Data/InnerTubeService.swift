@@ -209,6 +209,13 @@ actor InnerTubeService: MusicService {
         var extraContext: [String: Any]
         var useMusicOrigin: Bool
         var needsSignatureTimestamp: Bool
+        /// Whether the client runs in a browser, and so has to be fetched
+        /// with an Origin and a Referer. The native app clients must not
+        /// have them: a request dressed as a browser for a URL an app
+        /// minted is as wrong as the other way round, and googlevideo
+        /// refuses it (`PlayerClient.mediaHeaders` in the shared code says
+        /// the same about the desktop and the phone).
+        var isBrowserShaped: Bool
     }
 
     private var playerClients: [PlayerClientProfile] {
@@ -220,56 +227,56 @@ actor InnerTubeService: MusicService {
                 clientName: "IOS", clientNameHeader: "5", clientVersion: iosVersion,
                 userAgent: "com.google.ios.youtube/\(iosVersion) (iPhone16,2; U; CPU iOS \(osVersion) like Mac OS X;)",
                 extraContext: ["deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": osVersion.replacingOccurrences(of: "_", with: ".")],
-                useMusicOrigin: false, needsSignatureTimestamp: false
+                useMusicOrigin: false, needsSignatureTimestamp: false, isBrowserShaped: false
             ),
             PlayerClientProfile(
                 clientName: "ANDROID_VR", clientNameHeader: "28", clientVersion: "1.65.10",
                 userAgent: "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
                 extraContext: ["deviceMake": "Oculus", "deviceModel": "Quest 3", "osName": "Android", "osVersion": "12L", "androidSdkVersion": 32],
-                useMusicOrigin: false, needsSignatureTimestamp: false
+                useMusicOrigin: false, needsSignatureTimestamp: false, isBrowserShaped: false
             ),
             PlayerClientProfile(
                 clientName: "TVHTML5", clientNameHeader: "7", clientVersion: "7.20260707.07.00",
                 userAgent: "Mozilla/5.0(SMART-TV; Linux; Tizen 4.0.0.2) AppleWebkit/605.1.15 (KHTML, like Gecko) SamsungBrowser/9.2 TV Safari/605.1.15",
                 extraContext: [:],
-                useMusicOrigin: false, needsSignatureTimestamp: false
+                useMusicOrigin: false, needsSignatureTimestamp: false, isBrowserShaped: true
             ),
             PlayerClientProfile(
                 clientName: "IOS", clientNameHeader: "5", clientVersion: "21.26.4",
                 userAgent: "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
                 extraContext: ["deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": "18.3.2"],
-                useMusicOrigin: false, needsSignatureTimestamp: false
+                useMusicOrigin: false, needsSignatureTimestamp: false, isBrowserShaped: false
             ),
             PlayerClientProfile(
                 clientName: "WEB_REMIX", clientNameHeader: "67", clientVersion: webRemixVersion,
                 userAgent: webUserAgent,
                 extraContext: [:],
-                useMusicOrigin: true, needsSignatureTimestamp: true
+                useMusicOrigin: true, needsSignatureTimestamp: true, isBrowserShaped: true
             ),
             PlayerClientProfile(
                 clientName: "WEB", clientNameHeader: "1", clientVersion: "2.20260708.00.00",
                 userAgent: webUserAgent,
                 extraContext: [:],
-                useMusicOrigin: false, needsSignatureTimestamp: true
+                useMusicOrigin: false, needsSignatureTimestamp: true, isBrowserShaped: true
             ),
             PlayerClientProfile(
                 clientName: "ANDROID", clientNameHeader: "3", clientVersion: "21.26.364",
                 userAgent: "com.google.android.youtube/21.26.364 (Linux; U; Android 15; en_US; Pixel 9 Pro; Build/AP4A.250205.002; Cronet/132.0.6834.79) gzip",
                 extraContext: ["osName": "Android", "osVersion": "15", "androidSdkVersion": 35],
-                useMusicOrigin: false, needsSignatureTimestamp: false
+                useMusicOrigin: false, needsSignatureTimestamp: false, isBrowserShaped: false
             ),
             PlayerClientProfile(
                 clientName: "ANDROID_MUSIC", clientNameHeader: "21", clientVersion: "8.39.42",
                 userAgent: "com.google.android.apps.youtube.music/8.39.42 (Linux; U; Android 15; en_US; Pixel 9 Pro; Build/AP4A.250205.002) gzip",
                 extraContext: ["osName": "Android", "osVersion": "15", "androidSdkVersion": 35],
-                useMusicOrigin: false, needsSignatureTimestamp: false
+                useMusicOrigin: false, needsSignatureTimestamp: false, isBrowserShaped: false
             )
         ]
     }
 
     private let decipher = SignatureDecipher()
     private var excludedClients: [String: [String: Date]] = [:]
-    private var resolvedCache: [String: (stream: ResolvedMusicStream, resolvedAt: Date)] = [:]
+    private var resolvedCache: [String: (streams: [ResolvedMusicStream], resolvedAt: Date)] = [:]
     private static let exclusionWindow: TimeInterval = 10 * 60
     private static let resolvedLifetime: TimeInterval = 5 * 60 * 60
 
@@ -278,11 +285,24 @@ actor InnerTubeService: MusicService {
     }
 
     func resolveStream(for track: MusicTrack, quality: AudioQuality) async throws -> ResolvedMusicStream {
+        guard let first = try await resolveStreams(for: track, quality: quality).first else {
+            throw MusicRequestError.noPlayableStream
+        }
+        return first
+    }
+
+    /// Every stream that answered for this track, best first.
+    ///
+    /// The player takes the first and moves to the next when the one it was
+    /// given is refused: a URL that cleared the probe can still be turned
+    /// down by the CDN once the player asks it for the bytes it will
+    /// actually read, so the whole list is the answer and not just its head.
+    func resolveStreams(for track: MusicTrack, quality: AudioQuality) async throws -> [ResolvedMusicStream] {
         guard let videoID = track.videoID else { throw MusicRequestError.noPlayableStream }
         if let cached = resolvedCache[videoID],
            Date().timeIntervalSince(cached.resolvedAt) < Self.resolvedLifetime,
-           (cached.stream.bitrateKbps ?? Int.max) <= quality.maxKbps {
-            return cached.stream
+           (cached.streams.first?.bitrateKbps ?? Int.max) <= quality.maxKbps {
+            return cached.streams
         }
         await ensureClientVersion()
         var lastRefusal: String?
@@ -290,9 +310,9 @@ actor InnerTubeService: MusicService {
         for profile in playerClients {
             if isExcluded(client: profile.clientName + profile.clientVersion, videoID: videoID) { continue }
             do {
-                let stream = try await resolveWithClient(profile, videoID: videoID, quality: quality)
-                resolvedCache[videoID] = (stream, Date())
-                return stream
+                let streams = try await resolveWithClient(profile, videoID: videoID, quality: quality)
+                resolvedCache[videoID] = (streams, Date())
+                return streams
             } catch let error as MusicRequestError {
                 switch error {
                 case .unsupportedFormat:
@@ -314,7 +334,7 @@ actor InnerTubeService: MusicService {
         throw MusicRequestError.noPlayableStream
     }
 
-    private func resolveWithClient(_ profile: PlayerClientProfile, videoID: String, quality: AudioQuality) async throws -> ResolvedMusicStream {
+    private func resolveWithClient(_ profile: PlayerClientProfile, videoID: String, quality: AudioQuality) async throws -> [ResolvedMusicStream] {
         let origin = profile.useMusicOrigin ? musicOrigin : youtubeOrigin
         var client: [String: Any] = [
             "clientName": profile.clientName,
@@ -405,13 +425,12 @@ actor InnerTubeService: MusicService {
             return !primaryItags.contains(itag)
         }
 
-        let mediaHeaders = [
-            "User-Agent": profile.userAgent,
-            "Origin": origin,
-            "Referer": "\(origin)/"
-        ]
-
+        // The headers the media fetch has to carry are the ones belonging to
+        // the client that minted the URL, and every candidate names its own
+        // — so they are worked out per candidate, not once for the client
+        // that asked.
         var sawCipher = false
+        var found: [ResolvedMusicStream] = []
         for format in preferredOrder {
             var candidateURL: URL?
             if let raw = format["url"] as? String, let url = URL(string: raw) {
@@ -424,40 +443,141 @@ actor InnerTubeService: MusicService {
                 candidateURL = try? await decipher.decipherURL(signatureCipher: cipher, videoID: videoID)
             }
             guard let url = candidateURL else { continue }
-            if await probe(url: url, headers: mediaHeaders) {
-                let mime = (format["mimeType"] as? String) ?? ""
-                let codec = mime.components(separatedBy: "codecs=\"").last?
-                    .components(separatedBy: "\"").first ?? "AAC"
-                return ResolvedMusicStream(
-                    url: url,
-                    headers: mediaHeaders,
-                    codec: codec,
-                    bitrateKbps: bitrateKbps(of: format),
-                    sampleRateHz: (format["audioSampleRate"] as? String).flatMap(Int.init)
-                        ?? (format["audioSampleRate"] as? NSNumber)?.intValue,
-                    clientName: profile.clientName
-                )
+            let minting = clientMinting(url: url) ?? profile
+            let headers = mediaHeaders(for: minting)
+            guard await probe(url: url, headers: headers) else { continue }
+            let mime = (format["mimeType"] as? String) ?? ""
+            let codec = mime.components(separatedBy: "codecs=\"").last?
+                .components(separatedBy: "\"").first ?? "AAC"
+            found.append(ResolvedMusicStream(
+                url: url,
+                headers: headers,
+                codec: codec,
+                bitrateKbps: bitrateKbps(of: format),
+                sampleRateHz: (format["audioSampleRate"] as? String).flatMap(Int.init)
+                    ?? (format["audioSampleRate"] as? NSNumber)?.intValue,
+                clientName: minting.clientName
+            ))
+            // A few answers is plenty: the player only wants a second one
+            // for the case where the first is refused, and every probe is a
+            // real read of the stream.
+            if found.count >= Self.maxProbedStreams { break }
+        }
+        if found.isEmpty {
+            if sawCipher && playable.allSatisfy({ $0["url"] == nil }) {
+                throw MusicRequestError.unsupportedFormat
             }
+            throw MusicRequestError.noPlayableStream
         }
-        if sawCipher && playable.allSatisfy({ $0["url"] == nil }) {
-            throw MusicRequestError.unsupportedFormat
-        }
-        throw MusicRequestError.noPlayableStream
+        return found
     }
 
-    /// Android's probe, shrunk: some clients' URLs answer a player request
-    /// fine and then 403 the media fetch (or everything past the first
-    /// megabyte). A two-byte ranged read with the minting client's headers
-    /// is the request that matters.
+    /// The headers the media fetch for a URL has to carry.
+    ///
+    /// googlevideo compares the identity of the request that minted the URL
+    /// with the one that fetches it, and refuses the fetch when they
+    /// differ. The native app clients are therefore fetched with nothing
+    /// but their agent — an Origin and a Referer would dress the request
+    /// as a browser, which is as wrong for an app-minted URL as leaving
+    /// them off a browser's. The browser-shaped clients keep both. This is
+    /// `PlayerClient.mediaHeaders` in the shared code, which the phone and
+    /// the desktop both fetch their streams with.
+    private func mediaHeaders(for profile: PlayerClientProfile) -> [String: String] {
+        var headers = ["User-Agent": profile.userAgent]
+        if profile.isBrowserShaped {
+            let origin = profile.useMusicOrigin ? musicOrigin : youtubeOrigin
+            headers["Origin"] = origin
+            headers["Referer"] = "\(origin)/"
+        }
+        return headers
+    }
+
+    /// The client a googlevideo URL says minted it, so the media fetch can
+    /// be dressed as that client whatever produced the URL.
+    private func clientMinting(url: URL) -> PlayerClientProfile? {
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let name = (query.first { $0.name == "c" }?.value ?? "").uppercased()
+        guard !name.isEmpty else { return nil }
+        let candidates = playerClients.filter { $0.clientName.uppercased() == name }
+        guard !candidates.isEmpty else { return nil }
+        if let version = query.first(where: { $0.name == "cver" })?.value,
+           let exact = candidates.first(where: { $0.clientVersion == version }) {
+            return exact
+        }
+        return candidates.first
+    }
+
+    /// Whether a URL really serves the bytes the player will ask it for.
+    ///
+    /// The range has to be as large as the real fetch's, not a token one:
+    /// a URL minted for a session Google has reservations about serves
+    /// small ranges to anybody — enough to pass a small probe — and then
+    /// refuses the multi-megabyte ranges actual listening is made of, which
+    /// is what the player runs into. The range starts past the megabyte
+    /// when the file is that long, because some clients' URLs serve the
+    /// first megabyte and refuse everything after it. And the answer has
+    /// to be audio: a refusal dressed as a success — an error page — is a
+    /// refusal. This is the shared resolver's probe, which the phone and
+    /// the desktop both use before handing a URL to the player.
     private func probe(url: URL, headers: [String: String]) async -> Bool {
+        let range = Self.probeRange(for: url)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        request.setValue("bytes=\(range.start)-\(range.end)", forHTTPHeaderField: "Range")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
-        guard let (_, response) = try? await session.data(for: request),
-              let http = response as? HTTPURLResponse else { return false }
-        return http.statusCode == 200 || http.statusCode == 206
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            guard (200..<300).contains(http.statusCode) else { return false }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+            guard contentType.hasPrefix("audio/") else { return false }
+            // Headers can arrive long before a body that never does: the
+            // bytes have to actually be there. Only the first stretch of
+            // the answer is read — the range asked for is the big one, the
+            // read is the small one.
+            var read = 0
+            for try await _ in bytes {
+                read += 1
+                if read >= Self.probeReadBytes { break }
+            }
+            return read >= min(Self.probeReadBytes, max(1, range.end - range.start + 1))
+        } catch {
+            return false
+        }
     }
+
+    /// The byte range the probe reads.
+    ///
+    /// It has to be as large as the range the real fetch asks for, and it
+    /// starts past the megabyte when the file is that long: some clients'
+    /// URLs serve the first megabyte and refuse everything after it, so a
+    /// probe of the opening passes and playback dies a minute in.
+    static func probeRange(for url: URL) -> (start: Int, end: Int) {
+        let length = contentLength(of: url)
+        let start = (length ?? 0) > authBoundaryBytes + probeReadBytes ? authBoundaryBytes : 0
+        let end = min(start + probeRangeBytes, length ?? Int.max) - 1
+        return (start, end)
+    }
+
+    /// The length the URL says its stream is, in bytes.
+    static func contentLength(of url: URL) -> Int? {
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard let raw = query.first(where: { $0.name == "clen" })?.value,
+              let length = Int(raw), length > 0 else { return nil }
+        return length
+    }
+
+    /// Where googlevideo stops authorising some clients' URLs: they serve
+    /// the first megabyte and refuse everything after it.
+    private static let authBoundaryBytes = 1_048_576
+    /// How much of the answer has to actually arrive for the URL to count.
+    private static let probeReadBytes = 16_384
+    /// The size of the range the probe asks for — as large as the range the
+    /// real fetch asks for, which is the whole point of the probe.
+    private static let probeRangeBytes = 1_048_576
+    /// How many answers one client may keep: the player wants a second one
+    /// for the case where the first is refused.
+    private static let maxProbedStreams = 3
 
     private func isExcluded(client: String, videoID: String) -> Bool {
         guard let until = excludedClients[videoID]?[client] else { return false }

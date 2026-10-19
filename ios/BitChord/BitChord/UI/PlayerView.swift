@@ -82,6 +82,37 @@ private enum PlayerPanel {
     case queue
 }
 
+/// The player's own measurements for the space it is given.
+///
+/// The now-playing screen is a phone's: one column, the artwork on top of
+/// it and the controls under it, all of the same width. A window wider
+/// than a phone — a Mac, an iPad in landscape — must not stretch that
+/// column across the whole width: the scrubber, the transport and the
+/// action row would end up a hand's width apart, and the artwork would
+/// float in the middle of them instead of lining up with the titles
+/// under it. So the column keeps a phone's proportions and is centred in
+/// whatever it is given, and the artwork gives up room when the window is
+/// short rather than pushing the controls off the bottom.
+struct PlayerLayout {
+    /// The width of the column — the artwork's, so the two line up.
+    let columnWidth: CGFloat
+
+    /// The artwork's edge: square, as wide as the column.
+    var artworkSize: CGFloat { columnWidth }
+
+    init(in size: CGSize) {
+        // The rows under the artwork — the title block, the scrubber, the
+        // transport, the volume, the action row, the bottom row — with the
+        // gaps between them. What is left over is the artwork's.
+        let belowArtwork: CGFloat = 410
+        let room = size.height - belowArtwork
+        // A phone's width, and no wider than a comfortable column.
+        let widest = min(max(size.width - 48, 240), 460)
+        // Never narrower than the transport and the action row need.
+        columnWidth = max(300, min(widest, room))
+    }
+}
+
 /// The now-playing screen — Android's `NowPlayingScreen` layout: artwork (or
 /// the lyrics/queue panel in its place), title block, scrubber, transport,
 /// volume, then the action row with the shuffle/repeat/autoplay capsule
@@ -96,12 +127,12 @@ struct PlayerView: View {
     var body: some View {
         NavigationStack {
             GeometryReader { geometry in
-                let artworkSize = min(geometry.size.width - 48, 340)
+                let layout = PlayerLayout(in: geometry.size)
                 ZStack {
                     PlayerBackdrop(url: model.playback.currentTrack?.artworkURL)
                     if let track = model.playback.currentTrack {
                         VStack(spacing: 14) {
-                            panelArea(track: track, size: artworkSize)
+                            panelArea(track: track, size: layout.artworkSize)
 
                             titleBlock(track)
 
@@ -134,6 +165,13 @@ struct PlayerView: View {
                             bottomRow(track)
                             Spacer(minLength: 0)
                         }
+                        // The phone's column, centred in a wider window. A
+                        // Mac's or an iPad's is wide enough to stretch the
+                        // scrubber, the transport and the action row across
+                        // the whole thing, which is neither how the phone
+                        // looks nor how the artwork lines up with them.
+                        .frame(maxWidth: layout.columnWidth)
+                        .frame(maxWidth: .infinity)
                         .padding(.horizontal, 24)
                         .padding(.top, 8)
                     } else {

@@ -36,6 +36,14 @@ protocol MusicService: Sendable {
     /// have no connection context.
     func resolveStream(for track: MusicTrack, quality: AudioQuality) async throws -> ResolvedMusicStream
 
+    /// Every stream that answered for this track, best first.
+    ///
+    /// The player takes the first and moves on to the next when the one it
+    /// was given is refused: a URL that cleared the probe can still be
+    /// turned down by the CDN once the player asks it for the bytes it will
+    /// really read.
+    func resolveStreams(for track: MusicTrack, quality: AudioQuality) async throws -> [ResolvedMusicStream]
+
     // Radio / autoplay: the watch-next queue for `RDAMVM<videoID>`.
     func radio(videoID: String) async throws -> [MusicTrack]
 

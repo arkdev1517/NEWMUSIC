@@ -32,6 +32,8 @@
 		C0E503012EAFB44CBA96B08F /* QueueEngineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECABDD5631138B72203D2F13 /* QueueEngineTests.swift */; };
 		61FC55C82349ABB2FDE65359 /* ScrobbleAndStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA59DF5011B9BB21B32F7CD0 /* ScrobbleAndStatsTests.swift */; };
 		AC98323D45CEAA7F453250BD /* SignatureDecipherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FF68F35F94280136CEA63BA /* SignatureDecipherTests.swift */; };
+		A1F0C1D2E3F4A5B6C7D8E9F0 /* PlayerLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1F0C1D2E3F4A5B6C7D8E9F1 /* PlayerLayoutTests.swift */; };
+		B2F0C1D2E3F4A5B6C7D8E9F0 /* StreamProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2F0C1D2E3F4A5B6C7D8E9F1 /* StreamProbeTests.swift */; };
 		E7727417241752E2736312B5 /* JavaScriptCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DBC36029170048246F2DF70 /* JavaScriptCore.framework */; };
 		F1832245D7B8C7A0BFDF13CB /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4F3A977FC6340E748D0C5F6F /* Network.framework */; };
 		0373F0CCB2165C1DF9E403A1 /* CryptoKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0E58567BD59BB1D6E1C32CE0 /* CryptoKit.framework */; };
@@ -115,6 +117,8 @@
 		ECABDD5631138B72203D2F13 /* QueueEngineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueueEngineTests.swift; sourceTree = "<group>"; };
 		AA59DF5011B9BB21B32F7CD0 /* ScrobbleAndStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrobbleAndStatsTests.swift; sourceTree = "<group>"; };
 		2FF68F35F94280136CEA63BA /* SignatureDecipherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignatureDecipherTests.swift; sourceTree = "<group>"; };
+		A1F0C1D2E3F4A5B6C7D8E9F1 /* PlayerLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerLayoutTests.swift; sourceTree = "<group>"; };
+		B2F0C1D2E3F4A5B6C7D8E9F1 /* StreamProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProbeTests.swift; sourceTree = "<group>"; };
 		6DBC36029170048246F2DF70 /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		4F3A977FC6340E748D0C5F6F /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		04D87A8B1BEC840A15E67103 /* ListenTogetherClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListenTogetherClient.swift; sourceTree = "<group>"; };
@@ -226,6 +230,8 @@
 				ECABDD5631138B72203D2F13 /* QueueEngineTests.swift */,
 				AA59DF5011B9BB21B32F7CD0 /* ScrobbleAndStatsTests.swift */,
 				2FF68F35F94280136CEA63BA /* SignatureDecipherTests.swift */,
+				A1F0C1D2E3F4A5B6C7D8E9F1 /* PlayerLayoutTests.swift */,
+				B2F0C1D2E3F4A5B6C7D8E9F1 /* StreamProbeTests.swift */,
 			);
 			path = BitChordTests;
 			sourceTree = "<group>";
@@ -478,6 +484,8 @@
 				C0E503012EAFB44CBA96B08F /* QueueEngineTests.swift in Sources */,
 				61FC55C82349ABB2FDE65359 /* ScrobbleAndStatsTests.swift in Sources */,
 				AC98323D45CEAA7F453250BD /* SignatureDecipherTests.swift in Sources */,
+				A1F0C1D2E3F4A5B6C7D8E9F0 /* PlayerLayoutTests.swift in Sources */,
+				B2F0C1D2E3F4A5B6C7D8E9F0 /* StreamProbeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

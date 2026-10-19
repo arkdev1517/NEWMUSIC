@@ -23,6 +23,9 @@ final class PlaybackController: ObservableObject {
     var onPauseCommand: (() -> Void)?
     var onTogglePlaybackCommand: (() -> Void)?
     var onSeekCommand: ((TimeInterval) -> Void)?
+    /// Called when an item will not load, so the caller can try another
+    /// stream for the same track before giving up on it.
+    var onLoadFailure: ((Error?) -> Void)?
 
     private let player = AVPlayer()
     private var timeObserver: Any?
@@ -103,7 +106,6 @@ final class PlaybackController: ObservableObject {
         player.replaceCurrentItem(with: item)
         itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
             let status = observedItem.status
-            let failure = observedItem.error?.localizedDescription
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 switch status {
@@ -115,8 +117,12 @@ final class PlaybackController: ObservableObject {
                     self.publishNowPlaying()
                 case .failed:
                     self.isLoading = false
-                    self.errorMessage = failure ?? "This audio file could not be played."
+                    self.errorMessage = Self.message(for: observedItem.error)
                     self.publishNowPlaying()
+                    // The caller may have another stream for this track: a
+                    // URL that cleared the probe can still be turned down by
+                    // the CDN once the player asks it for real bytes.
+                    self.onLoadFailure?(observedItem.error)
                 case .unknown:
                     break
                 @unknown default:
@@ -138,6 +144,20 @@ final class PlaybackController: ObservableObject {
         isLoading = false
         errorMessage = message
         publishNowPlaying()
+    }
+
+    /// What the user is told when a stream will not load.
+    ///
+    /// AVFoundation's own wording for a refused URL is "An unknown error
+    /// occurred.", which says nothing at all: the refusal is named
+    /// instead, so the message is worth reading.
+    static func message(for error: Error?) -> String {
+        guard let error else { return "This audio file could not be played." }
+        let failure = error as NSError
+        if failure.domain == NSURLErrorDomain, failure.code == NSURLErrorUnknown {
+            return "YouTube refused this stream. Try the track again."
+        }
+        return failure.localizedDescription
     }
 
     func play() {
