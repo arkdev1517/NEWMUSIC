@@ -30,4 +30,27 @@ final class StreamProbeTests: XCTestCase {
         XCTAssertEqual(range.start, 0)
         XCTAssertGreaterThan(range.end, 0)
     }
+
+    func testAndroidVRRangeStaysWithinNarrowWindow() {
+        let url = URL(string: "https://r1.example.com/videoplayback?itag=140&c=ANDROID_VR&clen=5000000")!
+        let range = InnerTubeService.probeRange(for: url)
+        XCTAssertEqual(range.start, 1_048_576)
+        XCTAssertEqual(range.end - range.start + 1, 524_288)
+    }
+
+    func testChunkedResourceLoaderParsesTotalLengthFromContentRange() {
+        let url = URL(string: "https://r1.googlevideo.com/videoplayback?itag=140")!
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 206,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Range": "bytes 0-524287/3482910"]
+        )!
+        let total = ChunkedResourceLoader.parseTotalLength(
+            from: response,
+            fallbackDataCount: 524_288,
+            windowStart: 0
+        )
+        XCTAssertEqual(total, 3_482_910)
+    }
 }

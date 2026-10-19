@@ -43,6 +43,7 @@ protocol MusicService: Sendable {
     /// turned down by the CDN once the player asks it for the bytes it will
     /// really read.
     func resolveStreams(for track: MusicTrack, quality: AudioQuality) async throws -> [ResolvedMusicStream]
+    func markStreamRefused(_ stream: ResolvedMusicStream, for track: MusicTrack) async
 
     // Radio / autoplay: the watch-next queue for `RDAMVM<videoID>`.
     func radio(videoID: String) async throws -> [MusicTrack]
@@ -78,3 +79,8 @@ struct PlaylistEntryRef: Sendable, Hashable {
     var setVideoID: String
     var videoID: String
 }
+
+extension MusicService {
+    func markStreamRefused(_ stream: ResolvedMusicStream, for track: MusicTrack) async {}
+}
+

@@ -921,6 +921,7 @@ final class AppModel: ObservableObject {
         var startAt: TimeInterval
         var candidates: [ResolvedMusicStream]
         var index: Int
+        var reResolveCount: Int = 0
         var requestID: UUID
     }
 
@@ -999,7 +1000,39 @@ final class AppModel: ObservableObject {
         }
         // A failure from a track that is no longer the one being played.
         guard streamRequestID == attempt.requestID else { return }
-        guard attempt.index < attempt.candidates.count else {
+        if attempt.index >= attempt.candidates.count {
+            if attempt.reResolveCount < 2, let failedStream = attempt.candidates.last {
+                let nextReResolveCount = attempt.reResolveCount + 1
+                let requestID = attempt.requestID
+                let track = attempt.track
+                let autoplay = attempt.autoplay
+                let startAt = attempt.startAt
+                let quality = settings.effectiveQuality(metered: network.isMetered)
+                streamAttempt = nil
+                streamTask?.cancel()
+                streamTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.service.markStreamRefused(failedStream, for: track)
+                    do {
+                        let resolved = try await self.service.resolveStreams(for: track, quality: quality)
+                        guard self.streamRequestID == requestID else { return }
+                        self.streamAttempt = StreamAttempt(
+                            track: track,
+                            autoplay: autoplay,
+                            startAt: startAt,
+                            candidates: resolved,
+                            index: 0,
+                            reResolveCount: nextReResolveCount,
+                            requestID: requestID
+                        )
+                        self.loadNextCandidate(afterFailure: error)
+                    } catch {
+                        guard self.streamRequestID == requestID else { return }
+                        self.playback.failLoading(PlaybackController.message(for: error))
+                    }
+                }
+                return
+            }
             streamAttempt = nil
             playback.failLoading(PlaybackController.message(for: error))
             return

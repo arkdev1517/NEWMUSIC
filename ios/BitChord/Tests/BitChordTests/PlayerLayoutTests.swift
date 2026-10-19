@@ -37,4 +37,9 @@ final class PlayerLayoutTests: XCTestCase {
         let short = PlayerLayout(in: CGSize(width: 1200, height: 620))
         XCTAssertLessThan(short.columnWidth, tall.columnWidth)
     }
+
+    func testACompactPhoneNeverOverflowsItsHorizontalMargins() {
+        let layout = PlayerLayout(in: CGSize(width: 320, height: 568))
+        XCTAssertLessThanOrEqual(layout.columnWidth, 320 - 48)
+    }
 }

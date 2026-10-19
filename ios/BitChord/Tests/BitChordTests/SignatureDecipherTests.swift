@@ -24,6 +24,7 @@ final class SignatureDecipherTests: XCTestCase {
 
     func testSignatureTimestampExtraction() {
         XCTAssertEqual(SignatureDecipher.signatureTimestamp(in: "x={signatureTimestamp:20312}"), 20312)
+        XCTAssertEqual(SignatureDecipher.signatureTimestamp(in: #"{"sts":20742}"#), 20742)
         XCTAssertNil(SignatureDecipher.signatureTimestamp(in: "nothing here"))
     }
 
@@ -66,5 +67,27 @@ final class SignatureDecipherTests: XCTestCase {
         let ref = try SignatureDecipher.signatureFunction(in: script)
         let result = try SignatureDecipher.evaluate(functionNamed: ref, argument: "abcdef", script: script)
         XCTAssertEqual(result, "fedcba")
+    }
+
+    func testValidTransformedNRejectsInvalidTokens() {
+        XCTAssertTrue(SignatureDecipher.isValidTransformedN("AbCdEfGh123_-", original: "RawNToken9876"))
+        XCTAssertFalse(SignatureDecipher.isValidTransformedN("RawNToken9876", original: "RawNToken9876"))
+        XCTAssertFalse(SignatureDecipher.isValidTransformedN("undefined", original: "RawNToken9876"))
+        XCTAssertFalse(SignatureDecipher.isValidTransformedN("[object Object]", original: "RawNToken9876"))
+        XCTAssertFalse(SignatureDecipher.isValidTransformedN("abc", original: "RawNToken9876"))
+    }
+
+    func testParseZemerConfigsIncludesAliases() {
+        let json = """
+        {
+          "players": {
+            "4d596e5d": { "sig": "Le(25,1424,INPUT)", "nClass": "qt", "sts": 20742, "aliases": ["83f0e2d1"] }
+          }
+        }
+        """
+        let parsed = SignatureDecipher.parseZemerConfigsJSON(json)
+        XCTAssertEqual(parsed["4d596e5d"]?.nClass, "qt")
+        XCTAssertEqual(parsed["83f0e2d1"]?.sig, "Le(25,1424,INPUT)")
+        XCTAssertEqual(parsed["83f0e2d1"]?.sts, 20742)
     }
 }
