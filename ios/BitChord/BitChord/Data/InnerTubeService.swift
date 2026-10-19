@@ -184,53 +184,182 @@ actor InnerTubeService: MusicService {
     }
 
     func setLiked(_ liked: Bool, videoID: String) async throws {
-        guard credentials.string(for: SessionCredential.youtubeCookie) != nil else {
-            throw MusicRequestError.signInRequired
-        }
-        let endpoint = liked ? "like/like" : "like/removelike"
-        let response = try await musicRequest(endpoint, body: ["target": ["videoId": videoID]])
-        if let error = response["error"] as? InnerTubeObject {
-            let message = (error["message"] as? String) ?? "YouTube Music refused the change."
-            throw MusicRequestError.service(message)
-        }
+        try await rate(liked ? .like : .indifferent, videoID: videoID)
     }
 
-    /// Best-effort native playback using the repository's iOS InnerTube client.
-    /// Android also has InnerTubeX + NewPipe, PoToken generation and JavaScript
-    /// signature/`n` deciphering; those extraction engines are not silently
-    /// replaced with a fabricated URL here.
-    func resolveStream(for track: MusicTrack) async throws -> ResolvedMusicStream {
-        guard let videoID = track.videoID else { throw MusicRequestError.noPlayableStream }
-        await ensureClientVersion()
-        let version = "21.29.1" // IOS_RECENT in data/innertube/PlayerClient.kt
+    // MARK: - Stream resolution
+    //
+    // The same walk Android's `StreamResolver` performs, reduced to what iOS
+    // can honestly do: try the player-client catalog from `PlayerClient.kt`
+    // in order, take a direct URL when a client offers one, run the
+    // JavaScriptCore decipher (the NewPipe-equivalent layer) when a client
+    // only offers ciphered ones, probe the winner with a ranged request the
+    // way Android probes, and remember per-video client refusals for ten
+    // minutes (`EXCLUDE_MS`). The one Android layer with no iOS counterpart
+    // here is PoToken (BotGuard) minting: clients that demand one fail this
+    // walk and the next client is tried, exactly as a refused client is.
+    // No URL is ever fabricated — every candidate came from a player
+    // response for this video.
+
+    private struct PlayerClientProfile {
+        var clientName: String
+        var clientNameHeader: String
+        var clientVersion: String
+        var userAgent: String
+        var extraContext: [String: Any]
+        var useMusicOrigin: Bool
+        var needsSignatureTimestamp: Bool
+    }
+
+    private var playerClients: [PlayerClientProfile] {
+        let webRemixVersion = liveClientVersion
+        let iosVersion = "21.29.1"
         let osVersion = UIDevice.current.systemVersion.replacingOccurrences(of: ".", with: "_")
-        let userAgent = "com.google.ios.youtube/\(version) (iPhone; U; CPU iPhone OS \(osVersion) like Mac OS X;)"
-        let client: [String: Any] = [
-            "clientName": "IOS",
-            "clientVersion": version,
-            "hl": languageCode,
-            "gl": regionCode,
-            "deviceMake": "Apple",
-            "deviceModel": "iPhone"
+        return [
+            PlayerClientProfile(
+                clientName: "IOS", clientNameHeader: "5", clientVersion: iosVersion,
+                userAgent: "com.google.ios.youtube/\(iosVersion) (iPhone16,2; U; CPU iOS \(osVersion) like Mac OS X;)",
+                extraContext: ["deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": osVersion.replacingOccurrences(of: "_", with: ".")],
+                useMusicOrigin: false, needsSignatureTimestamp: false
+            ),
+            PlayerClientProfile(
+                clientName: "ANDROID_VR", clientNameHeader: "28", clientVersion: "1.65.10",
+                userAgent: "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                extraContext: ["deviceMake": "Oculus", "deviceModel": "Quest 3", "osName": "Android", "osVersion": "12L", "androidSdkVersion": 32],
+                useMusicOrigin: false, needsSignatureTimestamp: false
+            ),
+            PlayerClientProfile(
+                clientName: "TVHTML5", clientNameHeader: "7", clientVersion: "7.20260707.07.00",
+                userAgent: "Mozilla/5.0(SMART-TV; Linux; Tizen 4.0.0.2) AppleWebkit/605.1.15 (KHTML, like Gecko) SamsungBrowser/9.2 TV Safari/605.1.15",
+                extraContext: [:],
+                useMusicOrigin: false, needsSignatureTimestamp: false
+            ),
+            PlayerClientProfile(
+                clientName: "IOS", clientNameHeader: "5", clientVersion: "21.26.4",
+                userAgent: "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+                extraContext: ["deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": "18.3.2"],
+                useMusicOrigin: false, needsSignatureTimestamp: false
+            ),
+            PlayerClientProfile(
+                clientName: "WEB_REMIX", clientNameHeader: "67", clientVersion: webRemixVersion,
+                userAgent: webUserAgent,
+                extraContext: [:],
+                useMusicOrigin: true, needsSignatureTimestamp: true
+            ),
+            PlayerClientProfile(
+                clientName: "WEB", clientNameHeader: "1", clientVersion: "2.20260708.00.00",
+                userAgent: webUserAgent,
+                extraContext: [:],
+                useMusicOrigin: false, needsSignatureTimestamp: true
+            ),
+            PlayerClientProfile(
+                clientName: "ANDROID", clientNameHeader: "3", clientVersion: "21.26.364",
+                userAgent: "com.google.android.youtube/21.26.364 (Linux; U; Android 15; en_US; Pixel 9 Pro; Build/AP4A.250205.002; Cronet/132.0.6834.79) gzip",
+                extraContext: ["osName": "Android", "osVersion": "15", "androidSdkVersion": 35],
+                useMusicOrigin: false, needsSignatureTimestamp: false
+            ),
+            PlayerClientProfile(
+                clientName: "ANDROID_MUSIC", clientNameHeader: "21", clientVersion: "8.39.42",
+                userAgent: "com.google.android.apps.youtube.music/8.39.42 (Linux; U; Android 15; en_US; Pixel 9 Pro; Build/AP4A.250205.002) gzip",
+                extraContext: ["osName": "Android", "osVersion": "15", "androidSdkVersion": 35],
+                useMusicOrigin: false, needsSignatureTimestamp: false
+            )
         ]
-        var playerClient = client
-        if let visitorData { playerClient["visitorData"] = visitorData }
-        let body: [String: Any] = [
-            "context": ["client": playerClient],
+    }
+
+    private let decipher = SignatureDecipher()
+    private var excludedClients: [String: [String: Date]] = [:]
+    private var resolvedCache: [String: (stream: ResolvedMusicStream, resolvedAt: Date)] = [:]
+    private static let exclusionWindow: TimeInterval = 10 * 60
+    private static let resolvedLifetime: TimeInterval = 5 * 60 * 60
+
+    func resolveStream(for track: MusicTrack) async throws -> ResolvedMusicStream {
+        try await resolveStream(for: track, quality: .lossless)
+    }
+
+    func resolveStream(for track: MusicTrack, quality: AudioQuality) async throws -> ResolvedMusicStream {
+        guard let videoID = track.videoID else { throw MusicRequestError.noPlayableStream }
+        if let cached = resolvedCache[videoID],
+           Date().timeIntervalSince(cached.resolvedAt) < Self.resolvedLifetime,
+           (cached.stream.bitrateKbps ?? Int.max) <= quality.maxKbps {
+            return cached.stream
+        }
+        await ensureClientVersion()
+        var lastRefusal: String?
+        var sawCipherOnly = false
+        for profile in playerClients {
+            if isExcluded(client: profile.clientName + profile.clientVersion, videoID: videoID) { continue }
+            do {
+                let stream = try await resolveWithClient(profile, videoID: videoID, quality: quality)
+                resolvedCache[videoID] = (stream, Date())
+                return stream
+            } catch let error as MusicRequestError {
+                switch error {
+                case .unsupportedFormat:
+                    sawCipherOnly = true
+                case .service(let message):
+                    lastRefusal = message
+                default:
+                    break
+                }
+                exclude(client: profile.clientName + profile.clientVersion, videoID: videoID)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                exclude(client: profile.clientName + profile.clientVersion, videoID: videoID)
+            }
+        }
+        if let lastRefusal { throw MusicRequestError.service(lastRefusal) }
+        if sawCipherOnly { throw MusicRequestError.unsupportedFormat }
+        throw MusicRequestError.noPlayableStream
+    }
+
+    private func resolveWithClient(_ profile: PlayerClientProfile, videoID: String, quality: AudioQuality) async throws -> ResolvedMusicStream {
+        let origin = profile.useMusicOrigin ? musicOrigin : youtubeOrigin
+        var client: [String: Any] = [
+            "clientName": profile.clientName,
+            "clientVersion": profile.clientVersion,
+            "hl": languageCode,
+            "gl": regionCode
+        ]
+        for (key, value) in profile.extraContext { client[key] = value }
+        if visitorData == nil { await fetchVisitorData() }
+        if let visitorData { client["visitorData"] = visitorData }
+
+        var body: [String: Any] = [
+            "context": ["client": client],
             "videoId": videoID,
             "contentCheckOk": true,
             "racyCheckOk": true
         ]
+        if profile.needsSignatureTimestamp, let sts = await decipher.signatureTimestamp(videoID: videoID) {
+            body["playbackContext"] = ["contentPlaybackContext": ["signatureTimestamp": sts]]
+        }
+
+        var headers = [
+            "Origin": origin,
+            "Referer": "\(origin)/",
+            "X-YouTube-Client-Name": profile.clientNameHeader,
+            "X-YouTube-Client-Version": profile.clientVersion,
+            "User-Agent": profile.userAgent
+        ]
+        // The signed-in session rides along only on the music-web client,
+        // where it is also what unlocks account-only (e.g. Premium 256k)
+        // formats; app clients stay anonymous like they are on Android.
+        if profile.useMusicOrigin, let cookie = credentials.string(for: SessionCredential.youtubeCookie) {
+            await ensureSessionScope(for: cookie)
+            headers["Cookie"] = cookie
+            headers["X-Goog-AuthUser"] = sessionScope?.authUser ?? "0"
+            if let pageID = sessionScope?.pageID { headers["X-Goog-PageId"] = pageID }
+            if let sapisid = sapisid(in: cookie) {
+                headers["Authorization"] = Self.sapisidAuthorization(sapisid, origin: musicOrigin)
+            }
+        }
+
         let response = try await postJSON(
-            url: URL(string: "\(youtubeOrigin)/youtubei/v1/player?prettyPrint=false&hl=\(languageCode)")!,
+            url: URL(string: "\(origin)/youtubei/v1/player?prettyPrint=false&hl=\(languageCode)")!,
             body: body,
-            headers: [
-                "Origin": youtubeOrigin,
-                "Referer": "\(youtubeOrigin)/",
-                "X-YouTube-Client-Name": "5",
-                "X-YouTube-Client-Version": version,
-                "User-Agent": userAgent
-            ]
+            headers: headers
         )
         if let status = path(response, "playabilityStatus", "status") as? String, status != "OK" {
             let reason = (path(response, "playabilityStatus", "reason") as? String)
@@ -241,34 +370,253 @@ actor InnerTubeService: MusicService {
         let formats = (streaming["adaptiveFormats"] as? [InnerTubeObject] ?? [])
             + (streaming["formats"] as? [InnerTubeObject] ?? [])
         let audioFormats = formats.filter { format in
-            let mime = (format["mimeType"] as? String ?? "").lowercased()
-            return mime.hasPrefix("audio/")
+            ((format["mimeType"] as? String) ?? "").lowercased().hasPrefix("audio/")
         }
-        let direct = audioFormats.compactMap { format -> (URL, Int, String)? in
-            guard let rawURL = format["url"] as? String,
-                  let url = URL(string: rawURL),
-                  let mime = format["mimeType"] as? String else { return nil }
-            let bitrate = (format["averageBitrate"] as? NSNumber)?.intValue
-                ?? (format["bitrate"] as? NSNumber)?.intValue
-                ?? 0
-            return (url, bitrate, mime.lowercased())
+        // AVFoundation plays AAC in an MP4 container; Opus/WebM formats are
+        // real but unusable on iOS, so they never win here (Android's
+        // ExoPlayer + FFmpeg extension is the platform difference).
+        let playable = audioFormats.filter { format in
+            let mime = ((format["mimeType"] as? String) ?? "").lowercased()
+            return mime.contains("audio/mp4") || mime.contains("audio/aac")
         }
-        guard let playable = direct
-            .filter({ $0.2.contains("audio/mp4") || $0.2.contains("audio/aac") })
-            .max(by: { $0.1 < $1.1 }) else {
+        guard !playable.isEmpty else {
             if audioFormats.contains(where: { $0["signatureCipher"] != nil || $0["cipher"] != nil }) {
                 throw MusicRequestError.unsupportedFormat
             }
             throw MusicRequestError.noPlayableStream
         }
-        return ResolvedMusicStream(
-            url: playable.0,
-            headers: [
-                "User-Agent": userAgent,
-                "Origin": youtubeOrigin,
-                "Referer": "\(youtubeOrigin)/"
-            ]
-        )
+
+        func bitrateKbps(of format: InnerTubeObject) -> Int {
+            let bits = (format["averageBitrate"] as? NSNumber)?.intValue
+                ?? (format["bitrate"] as? NSNumber)?.intValue ?? 0
+            return max(1, bits / 1000)
+        }
+
+        // Android's pick under a ceiling: the best rung at or under it first,
+        // then the remaining rungs as fallbacks (never silently only the
+        // biggest stream). When nothing fits under the ceiling, the lowest
+        // rung above it leads.
+        let ordered = playable.sorted { bitrateKbps(of: $0) < bitrateKbps(of: $1) }
+        let underCeiling = ordered.filter { bitrateKbps(of: $0) <= quality.maxKbps }
+        let primary = underCeiling.isEmpty ? Array(ordered.prefix(1)) : Array(underCeiling.reversed())
+        let primaryItags = Set(primary.compactMap { ($0["itag"] as? NSNumber)?.intValue })
+        let preferredOrder = primary + ordered.filter { format in
+            guard let itag = (format["itag"] as? NSNumber)?.intValue else { return true }
+            return !primaryItags.contains(itag)
+        }
+
+        let mediaHeaders = [
+            "User-Agent": profile.userAgent,
+            "Origin": origin,
+            "Referer": "\(origin)/"
+        ]
+
+        var sawCipher = false
+        for format in preferredOrder {
+            var candidateURL: URL?
+            if let raw = format["url"] as? String, let url = URL(string: raw) {
+                // A direct URL still carries an untransformed `n`; transform
+                // is best-effort (a raw `n` serves, only slower).
+                candidateURL = try? await decipher.transformNParameter(in: url, videoID: videoID)
+                if candidateURL == nil { candidateURL = url }
+            } else if let cipher = (format["signatureCipher"] as? String) ?? (format["cipher"] as? String) {
+                sawCipher = true
+                candidateURL = try? await decipher.decipherURL(signatureCipher: cipher, videoID: videoID)
+            }
+            guard let url = candidateURL else { continue }
+            if await probe(url: url, headers: mediaHeaders) {
+                let mime = (format["mimeType"] as? String) ?? ""
+                let codec = mime.components(separatedBy: "codecs=\"").last?
+                    .components(separatedBy: "\"").first ?? "AAC"
+                return ResolvedMusicStream(
+                    url: url,
+                    headers: mediaHeaders,
+                    codec: codec,
+                    bitrateKbps: bitrateKbps(of: format),
+                    sampleRateHz: (format["audioSampleRate"] as? String).flatMap(Int.init)
+                        ?? (format["audioSampleRate"] as? NSNumber)?.intValue,
+                    clientName: profile.clientName
+                )
+            }
+        }
+        if sawCipher && playable.allSatisfy({ $0["url"] == nil }) {
+            throw MusicRequestError.unsupportedFormat
+        }
+        throw MusicRequestError.noPlayableStream
+    }
+
+    /// Android's probe, shrunk: some clients' URLs answer a player request
+    /// fine and then 403 the media fetch (or everything past the first
+    /// megabyte). A two-byte ranged read with the minting client's headers
+    /// is the request that matters.
+    private func probe(url: URL, headers: [String: String]) async -> Bool {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        guard let (_, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse else { return false }
+        return http.statusCode == 200 || http.statusCode == 206
+    }
+
+    private func isExcluded(client: String, videoID: String) -> Bool {
+        guard let until = excludedClients[videoID]?[client] else { return false }
+        if Date() > until {
+            excludedClients[videoID]?[client] = nil
+            return false
+        }
+        return true
+    }
+
+    private func exclude(client: String, videoID: String) {
+        if excludedClients.count > 64 { excludedClients.removeAll() }
+        excludedClients[videoID, default: [:]][client] = Date().addingTimeInterval(Self.exclusionWindow)
+    }
+
+    // MARK: - Radio, lyrics and history over InnerTube
+
+    private func nextResponse(videoID: String) async throws -> InnerTubeObject {
+        try await musicRequest("next", body: [
+            "videoId": videoID,
+            "playlistId": "RDAMVM\(videoID)",
+            "isAudioOnly": true
+        ])
+    }
+
+    func radio(videoID: String) async throws -> [MusicTrack] {
+        let response = try await nextResponse(videoID: videoID)
+        return InnerTubeParser.parseWatchQueue(response)
+    }
+
+    func youtubeLyrics(videoID: String) async throws -> [LyricLine]? {
+        let next = try await nextResponse(videoID: videoID)
+        guard let endpoint = InnerTubeParser.lyricsBrowseEndpoint(next) else { return nil }
+        var body: [String: Any] = ["browseId": endpoint.browseID]
+        if let params = endpoint.params { body["params"] = params }
+        let page = try await musicRequest("browse", body: body)
+        return InnerTubeParser.parseLyricsPage(page)
+    }
+
+    func transcriptLyrics(videoID: String) async throws -> [LyricLine]? {
+        // get_transcript expects a tiny protobuf: field 1, length, video id.
+        var bytes: [UInt8] = [10, UInt8(videoID.utf8.count)]
+        bytes.append(contentsOf: videoID.utf8)
+        let params = Data(bytes).base64EncodedString()
+        let response = try await musicRequest("get_transcript", body: ["params": params])
+        return InnerTubeParser.parseTranscript(response)
+    }
+
+    func historyTracks() async throws -> [MusicTrack] {
+        guard credentials.string(for: SessionCredential.youtubeCookie) != nil else {
+            throw MusicRequestError.signInRequired
+        }
+        let response = try await musicRequest("browse", body: ["browseId": "FEmusic_history"])
+        return InnerTubeParser.parseHistoryTracks(response)
+    }
+
+    // MARK: - Account writes (verbatim ports of Innertube.kt)
+
+    private func requireSession() throws {
+        guard credentials.string(for: SessionCredential.youtubeCookie) != nil else {
+            throw MusicRequestError.signInRequired
+        }
+    }
+
+    func rate(_ status: LikeStatus, videoID: String) async throws {
+        try requireSession()
+        let endpoint: String
+        switch status {
+        case .like: endpoint = "like/like"
+        case .dislike: endpoint = "like/dislike"
+        case .indifferent: endpoint = "like/removelike"
+        }
+        // musicRequest inspects the body for an `error` object: Innertube
+        // answers a refused write with HTTP 200 and the error in the body.
+        _ = try await musicRequest(endpoint, body: ["target": ["videoId": videoID]])
+    }
+
+    func setSaved(_ saved: Bool, playlistID: String) async throws {
+        try requireSession()
+        let endpoint = saved ? "like/like" : "like/removelike"
+        _ = try await musicRequest(endpoint, body: ["target": ["playlistId": playlistID]])
+    }
+
+    func setSubscribed(_ subscribed: Bool, channelID: String) async throws {
+        try requireSession()
+        let endpoint = subscribed ? "subscription/subscribe" : "subscription/unsubscribe"
+        _ = try await musicRequest(endpoint, body: ["channelIds": [channelID]])
+    }
+
+    func createPlaylist(title: String, description: String, videoIDs: [String]) async throws -> String {
+        try requireSession()
+        var body: [String: Any] = [
+            "title": title,
+            "description": description,
+            "privacyStatus": "PRIVATE"
+        ]
+        if !videoIDs.isEmpty { body["videoIds"] = videoIDs }
+        let response = try await musicRequest("playlist/create", body: body)
+        if let playlistID = response["playlistId"] as? String, !playlistID.isEmpty { return playlistID }
+        if let found = InnerTubeParser.findString(response, key: "playlistId") { return found }
+        throw MusicRequestError.service("The playlist was created but YouTube Music returned no id for it.")
+    }
+
+    func deletePlaylist(_ playlistID: String) async throws {
+        try requireSession()
+        _ = try await musicRequest("playlist/delete", body: ["playlistId": playlistID.removingVLPrefix])
+    }
+
+    private func editPlaylist(_ playlistID: String, actions: [[String: Any]]) async throws -> InnerTubeObject {
+        try requireSession()
+        let response = try await musicRequest("browse/edit_playlist", body: [
+            "playlistId": playlistID.removingVLPrefix,
+            "actions": actions
+        ])
+        // The endpoint answers STATUS_SUCCEEDED rather than an HTTP error
+        // when it refuses (a playlist the account merely saved, usually).
+        if let status = response["status"] as? String, status != "STATUS_SUCCEEDED" {
+            throw MusicRequestError.service("YouTube Music refused the edit (\(status)).")
+        }
+        return response
+    }
+
+    func addToPlaylist(_ playlistID: String, videoIDs: [String]) async throws -> [String: String] {
+        let actions: [[String: Any]] = videoIDs.map { videoID in
+            ["action": "ACTION_ADD_VIDEO", "addedVideoId": videoID]
+        }
+        let response = try await editPlaylist(playlistID, actions: actions)
+        var landed: [String: String] = [:]
+        for result in (response["playlistEditResults"] as? [InnerTubeObject] ?? []) {
+            guard let added = result["playlistEditVideoAddedResultData"] as? InnerTubeObject,
+                  let videoID = added["videoId"] as? String,
+                  let setVideoID = added["setVideoId"] as? String else { continue }
+            landed[videoID] = setVideoID
+        }
+        return landed
+    }
+
+    func removeFromPlaylist(_ playlistID: String, entries: [PlaylistEntryRef]) async throws {
+        let actions: [[String: Any]] = entries.map { entry in
+            ["action": "ACTION_REMOVE_VIDEO", "setVideoId": entry.setVideoID, "removedVideoId": entry.videoID]
+        }
+        _ = try await editPlaylist(playlistID, actions: actions)
+    }
+
+    func accountPlaylists() async throws -> [MusicItem] {
+        try requireSession()
+        let response = try await musicRequest("browse", body: ["browseId": "FEmusic_liked_playlists"])
+        return InnerTubeParser.parseLibraryItems(response).filter { $0.kind == .playlist || $0.browseID != nil }
+    }
+
+    func findArtistPageID(name: String) async throws -> String? {
+        let wanted = name.normalizedArtistName
+        guard !wanted.isEmpty else { return nil }
+        let page = try await searchPage(name, filter: .artists)
+        // A hit is accepted only when its own title is the name asked for —
+        // the first search hit for a name is not necessarily that artist.
+        return page.items.first { item in
+            item.kind == .artist && item.title.normalizedArtistName == wanted
+        }?.browseID
     }
 
     private var languageCode: String {
@@ -492,5 +840,20 @@ actor InnerTubeService: MusicService {
             cursor = dictionary[key]
         }
         return cursor
+    }
+}
+
+extension String {
+    /// The raw playlist id: `VL` is only the browse prefix, and the
+    /// create/delete/edit endpoints refuse it.
+    var removingVLPrefix: String {
+        hasPrefix("VL") ? String(dropFirst(2)) : self
+    }
+
+    /// Case- and diacritic-insensitive name folding for the exact-artist
+    /// match (Android's `normalizedArtistName`).
+    var normalizedArtistName: String {
+        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -11,8 +11,13 @@ final class PlaybackController: ObservableObject {
     @Published private(set) var position: TimeInterval = 0
     @Published private(set) var duration: TimeInterval = 0
     @Published private(set) var errorMessage: String?
+    /// Playback speed (Android offers 0.5×–2.0×). Setting AVPlayer's rate is
+    /// also how playback starts, so `play()` goes through `desiredRate`.
+    @Published private(set) var rate: Float = 1.0
+    private var desiredRate: Float = 1.0
 
     var onItemEnded: (() -> Void)?
+    var onNextTrackCommand: (() -> Void)?
     var onPreviousTrack: (() -> Void)?
     var onPlayCommand: (() -> Void)?
     var onPauseCommand: (() -> Void)?
@@ -39,6 +44,26 @@ final class PlaybackController: ObservableObject {
         installPlayerObservers()
         installRemoteCommands()
         installAudioSessionObservers()
+    }
+
+    /// True once an item is actually loaded in the player. A restored
+    /// session shows a track before anything is loaded; the first play
+    /// press resolves its stream instead of toggling an empty player.
+    var hasLoadedItem: Bool { player.currentItem != nil }
+
+    /// Session restore: put the track on display at the saved position
+    /// without resolving a stream — that waits for the first play press.
+    func restoreSession(track: MusicTrack, position savedPosition: TimeInterval) {
+        removeItemObservers()
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        currentTrack = track
+        isPlaying = false
+        isLoading = false
+        errorMessage = nil
+        position = max(0, savedPosition)
+        duration = track.durationSeconds ?? 0
+        publishNowPlaying()
     }
 
     func beginLoading(_ track: MusicTrack) {
@@ -118,13 +143,33 @@ final class PlaybackController: ObservableObject {
     func play() {
         guard player.currentItem != nil else { return }
         do { try AVAudioSession.sharedInstance().setActive(true) } catch { /* playback will surface item errors */ }
-        player.play()
+        // `play()` would force rate 1.0; going through the rate keeps a
+        // chosen playback speed across pause/resume.
+        player.rate = desiredRate
         publishNowPlaying()
     }
 
     func pause() {
         player.pause()
         publishNowPlaying()
+    }
+
+    /// Playback speed, clamped to the 0.5×–2.0× range Android offers.
+    /// Applies immediately when something is playing; otherwise it is the
+    /// rate the next `play()` (or freshly loaded item) starts at.
+    func setRate(_ newRate: Float) {
+        let clamped = min(max(newRate, 0.5), 2.0)
+        desiredRate = clamped
+        rate = clamped
+        if isPlaying { player.rate = clamped }
+        publishNowPlaying()
+    }
+
+    /// The player's own gain, under the system volume — what the crossfade
+    /// ramp breathes with. Not a user volume control (the mini player uses
+    /// `MPVolumeView` for that, like Apple Music).
+    func setVolume(_ newVolume: Float) {
+        player.volume = min(max(newVolume, 0), 1)
     }
 
     func togglePlayback() {
@@ -175,14 +220,14 @@ final class PlaybackController: ObservableObject {
         initialPosition = 0
         let shouldPlay = autoplayWhenReady
         guard startAt > 0 else {
-            if shouldPlay { player.play() } else { player.pause() }
+            if shouldPlay { player.rate = desiredRate } else { player.pause() }
             return
         }
         let time = CMTime(seconds: startAt, preferredTimescale: 600)
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if shouldPlay { self.player.play() } else { self.player.pause() }
+                if shouldPlay { self.player.rate = self.desiredRate } else { self.player.pause() }
             }
         }
     }
@@ -247,7 +292,10 @@ final class PlaybackController: ObservableObject {
             return .success
         })
         remoteTargets.append(center.nextTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor [weak self] in self?.onItemEnded?() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let command = self.onNextTrackCommand { command() } else { self.onItemEnded?() }
+            }
             return .success
         })
         remoteTargets.append(center.previousTrackCommand.addTarget { [weak self] _ in
@@ -300,7 +348,7 @@ final class PlaybackController: ObservableObject {
             MPMediaItemPropertyTitle: track.title,
             MPMediaItemPropertyArtist: track.artist,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(rate) : 0.0
         ]
         if let albumName = track.albumName { info[MPMediaItemPropertyAlbumTitle] = albumName }
         if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
