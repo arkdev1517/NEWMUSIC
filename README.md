@@ -46,6 +46,12 @@ Also install **[LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608
 
 Start a teleport on Wi‑Fi first; the session can keep working on cellular afterward.
 
+### Background use and reopening
+
+Leave Locus running in the background and keep LocalDevVPN connected for the best chance of maintaining a teleport. iOS controls background execution and may suspend or terminate the app. **Swiping Locus away force-closes it:** iOS does not guarantee that Locus can continue running or reconnect afterward, so a spoof cannot be guaranteed to stay active while it is closed.
+
+Locus saves the last successfully applied coordinate and attempts to reconnect automatically when reopened, without another tap on Teleport. The status shows whether reconnection succeeded; it retries while Locus is running if the tunnel is unavailable. Routes and joystick movement do not resume automatically, only the last applied coordinate. Press **Stop** to cancel automatic restoration. If Stop reports that the location could not be cleared, reconnect LocalDevVPN, then start and stop a teleport to clear it.
+
 ### Pokémon GO & similar games
 
 Locus spoofs location the same way Xcode’s developer tools do: it tells iOS “you’re here,” and other apps read that from the system. Apps that just trust GPS (Apple Maps, etc.) will follow it.
