@@ -96,11 +96,20 @@ final class SpoofSession: ObservableObject {
     init() {
         favorites = SavedPlace.load(key: favoritesKey)
         recents = SavedPlace.load(key: recentsKey)
+        if let saved = SavedSpoof.load() {
+            let coordinate = CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)
+            pin = coordinate
+            simulated = coordinate
+            travelMode = TravelMode(rawValue: saved.travelMode) ?? .walk
+            // The saved coordinate is only an intent; the tunnel must reconnect.
+            status = .reconnecting
+        }
     }
 
     var isSpoofing: Bool {
         if case .active = status { return true }
         if case .reconnecting = status { return true }
+        if case .dropped = status { return simulated != nil }
         return false
     }
 
@@ -119,21 +128,46 @@ final class SpoofSession: ObservableObject {
         stopJoystick()
         stopResend()
         stopHealth()
+        // Stop must cancel restoration even if the tunnel is unavailable.
+        SavedSpoof.clear()
         isBusy = true
         let result = LocationEngine.clear()
         isBusy = false
+        simulated = nil
+        status = .idle
+        endBackground()
+        locationKeeper.start()
         switch result {
         case .success:
-            simulated = nil
-            status = .idle
-            endBackground()
-            // Keep location updates running so the map puck / locate button
-            // can return to the real GPS fix (not the leftover pin).
-            locationKeeper.start()
+            lastError = nil
         case .failure(let error):
-            lastError = error.localizedDescription
-            status = .dropped(error.localizedDescription)
-            postDropNotification(error.localizedDescription)
+            lastError = "Stopped automatic restoration, but could not clear the simulated location: \(error.localizedDescription) Reconnect the tunnel and start and stop a teleport to clear it."
+        }
+    }
+
+    /// Reconnect a previously active teleport when the app is launched again.
+    /// The saved coordinate is not reported as active until the set succeeds.
+    func restoreIfNeeded(pairing: PairingStore) {
+        guard let saved = SavedSpoof.load() else { return }
+        guard !LocationEngine.isSessionActive else { return }
+        guard pairing.hasPairingFile else {
+            status = .dropped("Import an RPPairing file in Settings to restore the spoof.")
+            return
+        }
+        let coordinate = CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)
+        simulated = coordinate
+        status = .reconnecting
+        // Retry transient failures while the app is running.
+        startHealth(pairing: pairing)
+        apply(coordinate, pairing: pairing, markRecent: false, automatic: true)
+    }
+
+    /// Check the existing connection immediately when returning to the app.
+    func resumeFromBackground(pairing: PairingStore) {
+        if status == .active, let coordinate = simulated {
+            apply(coordinate, pairing: pairing, markRecent: false, automatic: true)
+        } else {
+            restoreIfNeeded(pairing: pairing)
         }
     }
 
@@ -189,6 +223,7 @@ final class SpoofSession: ObservableObject {
             guard let self else { return }
             var previous = coordinates[0]
             await MainActor.run {
+                guard !Task.isCancelled else { return }
                 self.apply(previous, pairing: pairing, markRecent: true)
             }
             for next in coordinates.dropFirst() {
@@ -209,6 +244,7 @@ final class SpoofSession: ObservableObject {
                     let delay = stepMeters / speed
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     await MainActor.run {
+                        guard !Task.isCancelled else { return }
                         self.apply(coord, pairing: pairing, markRecent: false)
                     }
                 }
@@ -287,7 +323,7 @@ final class SpoofSession: ObservableObject {
         return false
     }
 
-    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
+    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool, automatic: Bool = false) {
         if status == .idle || status.isDropped {
             status = .connecting
         }
@@ -305,6 +341,7 @@ final class SpoofSession: ObservableObject {
             pin = coordinate
             status = .active
             lastError = nil
+            SavedSpoof.save(coordinate: coordinate, travelMode: travelMode)
             beginBackground()
             locationKeeper.start()
             startResend(pairing: pairing)
@@ -313,10 +350,10 @@ final class SpoofSession: ObservableObject {
                 pushRecent(coordinate)
             }
         case .failure(let error):
-            lastError = error.localizedDescription
+            if !automatic { lastError = error.localizedDescription }
             if simulated != nil {
                 status = .dropped(error.localizedDescription)
-                postDropNotification(error.localizedDescription)
+                if !automatic { postDropNotification(error.localizedDescription) }
             } else {
                 status = .idle
             }
@@ -341,12 +378,22 @@ final class SpoofSession: ObservableObject {
         resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, let sim = self.simulated else { return }
-                _ = LocationEngine.set(
+                let result = LocationEngine.set(
                     latitude: sim.latitude,
                     longitude: sim.longitude,
                     pairingPath: pairing.pairingPath,
                     deviceIP: TunnelConfig.targetIP
                 )
+                switch result {
+                case .success:
+                    if self.status.isDropped || self.status == .reconnecting {
+                        self.status = .active
+                    }
+                case .failure(let error):
+                    let wasDropped = self.status.isDropped
+                    self.status = .dropped(error.localizedDescription)
+                    if !wasDropped { self.postDropNotification(error.localizedDescription) }
+                }
             }
         }
     }
@@ -363,10 +410,10 @@ final class SpoofSession: ObservableObject {
                 guard let self, let sim = self.simulated else { return }
                 if case .dropped = self.status {
                     self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
+                    self.apply(sim, pairing: pairing, markRecent: false, automatic: true)
                 } else if !LocationEngine.isSessionActive, self.isSpoofing {
                     self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
+                    self.apply(sim, pairing: pairing, markRecent: false, automatic: true)
                 }
             }
         }
@@ -427,5 +474,33 @@ final class SpoofSession: ObservableObject {
         let dLat = northMeters / earth * (180 / .pi)
         let dLon = eastMeters / (earth * cos(coordinate.latitude * .pi / 180)) * (180 / .pi)
         return CLLocationCoordinate2D(latitude: coordinate.latitude + dLat, longitude: coordinate.longitude + dLon)
+    }
+}
+
+/// The last successfully applied coordinate, retained until Stop is pressed.
+private struct SavedSpoof: Codable {
+    let latitude: Double
+    let longitude: Double
+    let travelMode: String
+
+    private static let key = "locus.activeSpoof"
+
+    static func load() -> SavedSpoof? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let saved = try? JSONDecoder().decode(SavedSpoof.self, from: data),
+              CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: saved.latitude, longitude: saved.longitude)) else {
+            return nil
+        }
+        return saved
+    }
+
+    static func save(coordinate: CLLocationCoordinate2D, travelMode: TravelMode) {
+        let saved = SavedSpoof(latitude: coordinate.latitude, longitude: coordinate.longitude, travelMode: travelMode.rawValue)
+        guard let data = try? JSONEncoder().encode(saved) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: key)
     }
 }
